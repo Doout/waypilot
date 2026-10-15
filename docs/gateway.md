@@ -62,6 +62,62 @@ Matching misses share a singleflight guard. A follower may use the leader's reta
 
 Set `prewarm = true` to allow initialization and catalog discovery without tool invocation. On new HTTP sessions, the predictor can prepare up to two permitted servers based on that user's past server use. Manual preparation uses `POST /v1/prewarm` with `{"servers":["deps","source"]}` and the MCP user/session/protocol headers. Two prewarm batches may run at once, with at most two servers each.
 
+## Remote state validation
+
+Use `state_tool` for a cooperative upstream that can report the exact versions read by a
+reusable tool. This is Waypilot's `state-v1` contract, carried in ordinary MCP tool results
+through [custom `_meta`](https://modelcontextprotocol.io/specification/2025-11-25/basic#meta).
+It is not a standard MCP freshness guarantee.
+
+```toml
+[servers.tools.read_document]
+reusable = true
+cache_ttl_ms = 60000
+state_tool = "document_version"
+```
+
+The gateway invokes `document_version` on the same server with
+`{"tool":"read_document","arguments":{"id":"42"}}`. Both that validator and
+`read_document` must return this metadata with their normal MCP result:
+
+```json
+{"_meta":{"io.waypilot/state":{"version":1,"resources":{"doc:42":"deployment-7:revision-19"}}}}
+```
+
+The upstream must capture the read result and its complete resource-version map atomically.
+Versions must change whenever relevant state, tool semantics, or schema changes, and must
+never be reused after deletion, recreation, or restart. Include a durable revision or
+incarnation identifier. The validator must return current versions independently of session
+history. Configure this only for tools with no required effect. Tool annotations do not
+establish this contract, and an uncooperative server cannot acquire it through gateway config.
+
+Waypilot compares exact evidence before lookup, checks ancestor observations before dependent
+work, and validates all recorded observations again before the release authorization gate.
+A changed witness invalidates the retained computation and its transitive descendants.
+Unchanged independent branches remain reusable. A recomputed parent gets a new receipt even
+if its value is identical. Unretained parents prevent descendant retention. Stale in-flight
+parent receipts cannot populate the dependent cache.
+
+Missing, malformed, or changed evidence rejects the request; there is no stale fallback or
+automatic replay. A state conflict uses JSON-RPC `-32010`. Transport errors, deadlines, rate
+limits, and access denials retain their existing error classes. These are validation-point
+checks, not a distributed snapshot, remote rollback, or a guarantee that the resource cannot
+change after the final observation. A workflow with external effects may fail after an effect
+has occurred; the gateway does not undo it.
+
+Users need grants for both the read tool and its validator. Validator calls consume tokens
+and upstream admission, use current authorization, and share the original request deadline.
+Responses retain at most 64 distinct validation observations; their arguments and version
+maps share the workflow's 1 MiB retained-data budget. Each map permits 1 to 64 resource/version
+pairs with nonempty strings up to 256 bytes. Arguments, results, and version values are not
+trace fields. `mcp.state.validate`, `waypilot.cache.lookup`, and the graph's `validate_state`
+node expose validation, lookup, and release-barrier timing. Admin statistics count validation
+calls, conflicts, and cache invalidations.
+
+The [state regression suite](../scripts/check_state.py) exercises HTTP JSON, HTTP SSE and
+stdio peers, including external mutation with unchanged downstream arguments. See
+[benchmarks](testing.md#remote-state-validation) for comparisons with the TTL-only baseline.
+
 ## Limits and shutdown
 
 Top-level defaults are `max_sessions = 128`, `max_in_flight = 32`, `session_ttl_seconds = 900` and `request_timeout_ms = 30000`. Each session permits 32 pending request IDs. Each server's `max_in_flight` defaults to 512.

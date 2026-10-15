@@ -20,7 +20,9 @@ use subtle::ConstantTimeEq;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
-use wayframe_cache::{Cache, Key, Scope};
+use wayframe_cache::{Cache, Evidence, Key, Scope};
+pub(crate) mod state;
+use state::{Lineage, RemoteState};
 
 mod http;
 mod network;
@@ -86,6 +88,8 @@ struct Metrics {
     cache_hits: AtomicU64,
     cache_misses: AtomicU64,
     cache_bypasses: AtomicU64,
+    state_checks: AtomicU64,
+    state_conflicts: AtomicU64,
     denied: AtomicU64,
     prewarms: AtomicU64,
     prewarm_errors: AtomicU64,
@@ -150,6 +154,7 @@ pub(crate) struct Outcome {
     pub result: Value,
     pub disposition: &'static str,
     pub elapsed_us: u128,
+    pub lineage: Lineage,
 }
 
 impl Gateway {
@@ -261,10 +266,25 @@ impl Gateway {
             })
         })
     }
+    pub(crate) fn permits(&self, actor: &Actor, tool: &str) -> bool {
+        actor.permits(tool)
+            && tool
+                .split_once("__")
+                .and_then(|(server, name)| {
+                    self.config
+                        .servers
+                        .iter()
+                        .find(|item| item.id == server)
+                        .and_then(|item| item.tools.get(name))
+                        .and_then(|rule| rule.state_tool.as_ref())
+                        .map(|validator| actor.permits(&format!("{server}__{validator}")))
+                })
+                .unwrap_or(true)
+    }
     pub(crate) fn authorize(&self, session: &Session, tool: &str, epoch: u64) -> Result<(), Fault> {
         if session.stopped.is_cancelled()
             || self.epoch.load(Ordering::Acquire) != epoch
-            || !session.actor.permits(tool)
+            || !self.permits(&session.actor, tool)
         {
             self.metrics.denied.fetch_add(1, Ordering::Relaxed);
             return Err(Fault::denied());
@@ -352,6 +372,7 @@ impl Gateway {
         arguments: Value,
         deadline: tokio::time::Instant,
         epoch: u64,
+        parents: &Lineage,
     ) -> Result<Outcome, Fault> {
         let started = Instant::now();
         self.authorize(&session, name, epoch)?;
@@ -396,28 +417,68 @@ impl Gateway {
             });
         }
         self.authorize(&session, name, epoch)?;
+        self.validate_states(&session, &parents.states, deadline, epoch)
+            .await?;
         let rule = server.tools.get(tool);
-        let reusable = rule.is_some_and(|rule| rule.reusable && rule.cache_ttl_ms > 0);
+        let reusable =
+            parents.cacheable && rule.is_some_and(|rule| rule.reusable && rule.cache_ttl_ms > 0);
+        let key = Key::new(
+            Scope {
+                tenant: &session.actor.settings.tenant,
+                subject: &session.actor.settings.id,
+                permissions: &session.actor.settings.tools,
+                generation: epoch,
+                route: &server.id,
+            },
+            "tools/call",
+            &format!("{}:{}:{}", server.revision, catalog.revision, tool),
+            &arguments,
+        )
+        .map_err(|_| Fault::invalid())?;
+        let mut lineage = Lineage {
+            cacheable: false,
+            receipts: Vec::new(),
+            states: parents.states.clone(),
+        };
+        let own_state = if let Some(validator) = rule.and_then(|rule| rule.state_tool.as_ref()) {
+            let mut state = RemoteState {
+                validator: format!("{server_id}__{validator}"),
+                arguments: json!({"tool":tool,"arguments":arguments}),
+                evidence: Evidence::default(),
+                key: key.clone(),
+            };
+            state.evidence = match self.probe_state(&session, &state, deadline, epoch).await {
+                Ok(evidence) => evidence,
+                Err(error) => {
+                    let _ = self.cache.invalidate(&key);
+                    self.metrics.state_conflicts.fetch_add(1, Ordering::Relaxed);
+                    return Err(error);
+                }
+            };
+            Some(state)
+        } else {
+            None
+        };
+        let evidence = own_state
+            .as_ref()
+            .map(|state| state.evidence.clone())
+            .unwrap_or_default();
+        let mut receipt = None;
         let (value, disposition) = if reusable {
-            let key = Key::new(
-                Scope {
-                    tenant: &session.actor.settings.tenant,
-                    subject: &session.actor.settings.id,
-                    permissions: &session.actor.settings.tools,
-                    generation: epoch,
-                    route: &server.id,
-                },
-                "tools/call",
-                &format!("{}:{}:{}", server.revision, catalog.revision, tool),
-                &arguments,
-            )
-            .map_err(|_| Fault::invalid())?;
-            if let Some(value) = self.cache.get(&key).map_err(|_| Fault {
-                code: -32603,
-                message: "result cache unavailable",
-            })? {
+            let lookup = || {
+                tracing::info_span!("waypilot.cache.lookup").in_scope(|| {
+                    self.cache
+                        .lookup(&key, &parents.receipts, &evidence)
+                        .map_err(|_| Fault {
+                            code: -32603,
+                            message: "result cache unavailable",
+                        })
+                })
+            };
+            if let Some(hit) = lookup()? {
                 self.metrics.cache_hits.fetch_add(1, Ordering::Relaxed);
-                ((*value).clone(), "reused")
+                receipt = Some(hit.dependency);
+                ((*hit.value).clone(), "reused")
             } else {
                 let _flight = self
                     .cache
@@ -428,39 +489,54 @@ impl Gateway {
                         message: "result wait deadline or capacity exceeded",
                     })?;
                 self.authorize(&session, name, epoch)?;
-                if let Some(value) = self.cache.get(&key).map_err(|_| Fault {
-                    code: -32603,
-                    message: "result cache unavailable",
-                })? {
+                // A follower's evidence must still be checked at the release barrier.
+                if let Some(hit) = lookup()? {
                     self.metrics.cache_hits.fetch_add(1, Ordering::Relaxed);
-                    ((*value).clone(), "joined")
+                    receipt = Some(hit.dependency);
+                    ((*hit.value).clone(), "joined")
                 } else {
                     self.metrics.cache_misses.fetch_add(1, Ordering::Relaxed);
                     let value = self
                         .call_upstream(&session, name, &client, arguments, deadline, epoch)
                         .await?;
+                    if let Some(state) = &own_state {
+                        self.check_observation(state, &value)?;
+                    }
                     if value["isError"] != true {
                         let bytes = serde_json::to_vec(&value)
                             .map_err(|_| Fault::invalid())?
                             .len();
-                        let _ = self.cache.insert(
+                        if let Ok(retained) = self.cache.retain(
                             key,
                             value.clone(),
                             bytes,
                             Duration::from_millis(rule.expect("reusable rule").cache_ttl_ms),
-                        );
+                            &parents.receipts,
+                            evidence,
+                        ) {
+                            receipt = Some(retained.dependency);
+                        }
                     }
                     (value, "executed")
                 }
             }
         } else {
             self.metrics.cache_bypasses.fetch_add(1, Ordering::Relaxed);
-            (
-                self.call_upstream(&session, name, &client, arguments, deadline, epoch)
-                    .await?,
-                "bypassed",
-            )
+            let value = self
+                .call_upstream(&session, name, &client, arguments, deadline, epoch)
+                .await?;
+            if let Some(state) = &own_state {
+                self.check_observation(state, &value)?;
+            }
+            (value, "bypassed")
         };
+        if let Some(receipt) = receipt {
+            lineage.cacheable = true;
+            lineage.receipts.push(receipt);
+        }
+        if let Some(state) = own_state {
+            lineage.add_state(Arc::new(state))?;
+        }
         self.authorize(&session, name, epoch)?;
         if tokio::time::Instant::now() >= deadline {
             return Err(Fault {
@@ -479,6 +555,7 @@ impl Gateway {
             result: value,
             disposition,
             elapsed_us: started.elapsed().as_micros(),
+            lineage,
         })
     }
 
@@ -693,14 +770,14 @@ impl Gateway {
                         message: "prefixed tool name exceeds supported limit",
                     });
                 }
-                if session.actor.permits(&name) {
+                if self.permits(&session.actor, &name) {
                     tool["name"] = json!(name);
                     tools.push(tool);
                 }
             }
         }
         for (name, workflow) in &self.workflows {
-            if session.actor.permits(name) && workflow.allowed(&session.actor) {
+            if self.permits(&session.actor, name) && workflow.allowed(self, &session.actor) {
                 tools.push(json!({"name":name,"description":workflow.definition.description,"inputSchema":workflow.definition.input_schema}));
             }
         }
@@ -901,7 +978,7 @@ impl Gateway {
         json!({"generation":self.epoch.load(Ordering::Acquire),"sessions":self.sessions.lock().expect("sessions poisoned").len(),
             "requests":metrics.requests.load(Ordering::Relaxed),"upstream_calls":metrics.upstream_calls.load(Ordering::Relaxed),
             "cache_hits":metrics.cache_hits.load(Ordering::Relaxed),"cache_misses":metrics.cache_misses.load(Ordering::Relaxed),
-            "cache_bypasses":metrics.cache_bypasses.load(Ordering::Relaxed),"denied":metrics.denied.load(Ordering::Relaxed),
+            "cache_bypasses":metrics.cache_bypasses.load(Ordering::Relaxed),"state_checks":metrics.state_checks.load(Ordering::Relaxed),"state_conflicts":metrics.state_conflicts.load(Ordering::Relaxed),"denied":metrics.denied.load(Ordering::Relaxed),
             "prewarms":metrics.prewarms.load(Ordering::Relaxed),"prewarm_errors":metrics.prewarm_errors.load(Ordering::Relaxed),
             "rejected_capacity":metrics.rejected.load(Ordering::Relaxed),"sessions_expired":metrics.expired.load(Ordering::Relaxed),
             "active_requests":self.config.max_in_flight-self.admission.available_permits(),

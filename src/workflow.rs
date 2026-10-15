@@ -1,7 +1,10 @@
 //! Authored MCP dataflow regions executed by Wayframe. No trace-inferred dependencies.
 use crate::{
     config::Workflow,
-    gateway::{Actor, Fault, Gateway, Outcome, Session},
+    gateway::{
+        state::{Lineage, RemoteState},
+        Actor, Fault, Gateway, Outcome, Session,
+    },
 };
 use anyhow::Result;
 use serde_json::{json, Map, Value};
@@ -25,6 +28,7 @@ struct Call {
     epoch: u64,
     error: Mutex<Option<Fault>>,
     retained: AtomicUsize,
+    states: Mutex<Vec<Arc<RemoteState>>>,
 }
 
 #[cfg(test)]
@@ -72,12 +76,14 @@ impl Context for Call {
 struct Inputs {
     call: Arc<Call>,
     values: BTreeMap<String, Value>,
+    lineage: Lineage,
 }
 #[derive(Clone)]
 struct Node {
     result: Value,
     disposition: &'static str,
     elapsed_us: u128,
+    lineage: Lineage,
 }
 
 fn fail(call: &Call, fault: Fault) -> Error {
@@ -86,6 +92,50 @@ fn fail(call: &Call, fault: Fault) -> Error {
         *error = Some(fault);
     }
     Error::Failed("tool_or_binding_failed")
+}
+fn record(call: &Call, lineage: &Lineage) -> Result<(), Error> {
+    let mut states = call.states.lock().expect("workflow states poisoned");
+    for state in &lineage.states {
+        if !states.contains(state) {
+            let bytes = state.arguments.to_string().len()
+                + state
+                    .evidence
+                    .resources()
+                    .iter()
+                    .map(|(k, v)| k.len() + v.len())
+                    .sum::<usize>();
+            if call
+                .retained
+                .fetch_add(bytes, Ordering::Relaxed)
+                .saturating_add(bytes)
+                > crate::upstream::MAX_MESSAGE
+            {
+                return Err(fail(
+                    call,
+                    Fault {
+                        code: -32002,
+                        message: "workflow state evidence budget exceeded",
+                    },
+                ));
+            }
+            states.push(state.clone());
+        }
+    }
+    if states.len() > 64 {
+        return Err(fail(call, crate::gateway::state::conflict()));
+    }
+    Ok(())
+}
+async fn validate(call: Arc<Call>) -> Result<(), Error> {
+    let states = call
+        .states
+        .lock()
+        .expect("workflow states poisoned")
+        .clone();
+    call.gateway
+        .validate_states(&call.session, &states, call.deadline.into(), call.epoch)
+        .await
+        .map_err(|error| fail(&call, error))
 }
 fn gate(call: &Call, required: &[String]) -> Decision {
     if call
@@ -150,10 +200,13 @@ impl Single {
                         call.arguments.clone(),
                         call.deadline.into(),
                         call.epoch,
+                        &Lineage::default(),
                     )
                     .await
                     .map_err(|error| fail(&call, error))?;
+                record(&call, &result.lineage)?;
                 Ok(Node {
+                    lineage: result.lineage,
                     result: result.result,
                     disposition: result.disposition,
                     elapsed_us: result.elapsed_us,
@@ -163,7 +216,10 @@ impl Single {
         let current = builder.gate("authorize_release", Phase::Authorize, &root, |call| {
             gate(call, &[])
         })?;
-        builder.depends_on(&current, &result)?;
+        let validated =
+            builder.asynchronous("validate_state", Phase::Authorize, &root, validate)?;
+        builder.depends_on(&validated, &result)?;
+        builder.depends_on(&current, &validated)?;
         let output =
             builder.dispatch(
                 "release",
@@ -186,6 +242,7 @@ impl Single {
         deadline: tokio::time::Instant,
         epoch: u64,
     ) -> Result<Outcome, Fault> {
+        let started = Instant::now();
         let call = Arc::new(Call {
             gateway,
             session,
@@ -195,6 +252,7 @@ impl Single {
             epoch,
             error: Mutex::new(None),
             retained: AtomicUsize::new(0),
+            states: Mutex::new(Vec::new()),
         });
         let run = self
             .flow
@@ -205,7 +263,8 @@ impl Single {
         Ok(Outcome {
             result: result.result.clone(),
             disposition: result.disposition,
-            elapsed_us: result.elapsed_us,
+            elapsed_us: started.elapsed().as_micros(),
+            lineage: result.lineage.clone(),
         })
     }
 }
@@ -234,6 +293,7 @@ impl Compiled {
             Ok(Inputs {
                 call,
                 values: BTreeMap::new(),
+                lineage: Lineage::default(),
             })
         })?;
         builder.depends_on(&base, &authorized)?;
@@ -255,9 +315,14 @@ impl Compiled {
                     move |inputs, value| {
                         let mut values = inputs.values.clone();
                         values.insert(name.clone(), value.result.clone());
+                        let mut lineage = inputs.lineage.clone();
+                        lineage
+                            .merge(&value.lineage)
+                            .map_err(|error| fail(&inputs.call, error))?;
                         Ok(Inputs {
                             call: inputs.call.clone(),
                             values,
+                            lineage,
                         })
                     },
                 )?;
@@ -302,6 +367,7 @@ impl Compiled {
                                 Value::Object(arguments),
                                 inputs.call.deadline.into(),
                                 inputs.call.epoch,
+                                &inputs.lineage,
                             )
                             .await
                             .map_err(|error| fail(&inputs.call, error))?;
@@ -330,7 +396,9 @@ impl Compiled {
                                 },
                             ));
                         }
+                        record(&inputs.call, &result.lineage)?;
                         Ok(Node {
+                            lineage: result.lineage,
                             result: result.result,
                             disposition: result.disposition,
                             elapsed_us: result.elapsed_us,
@@ -357,7 +425,10 @@ impl Compiled {
         let current = builder.gate("authorize_release", Phase::Authorize, &root, move |call| {
             gate(call, &required)
         })?;
-        builder.depends_on(&current, &collected)?;
+        let validated =
+            builder.asynchronous("validate_state", Phase::Authorize, &root, validate)?;
+        builder.depends_on(&validated, &collected)?;
+        builder.depends_on(&current, &validated)?;
         let output = builder.dispatch("release", &collected, |value| async move {
             Ok((*value).clone())
         })?;
@@ -370,11 +441,11 @@ impl Compiled {
         })
     }
 
-    pub fn allowed(&self, actor: &Actor) -> bool {
+    pub fn allowed(&self, gateway: &Gateway, actor: &Actor) -> bool {
         self.definition
             .steps
             .iter()
-            .all(|step| actor.permits(&step.tool))
+            .all(|step| gateway.permits(actor, &step.tool))
     }
 
     pub async fn run(
@@ -406,6 +477,7 @@ impl Compiled {
             epoch,
             error: Mutex::new(None),
             retained: AtomicUsize::new(0),
+            states: Mutex::new(Vec::new()),
         });
         let run = self
             .flow
@@ -421,6 +493,7 @@ impl Compiled {
             result,
             disposition: "workflow",
             elapsed_us: started.elapsed().as_micros(),
+            lineage: Lineage::default(),
         })
     }
 }

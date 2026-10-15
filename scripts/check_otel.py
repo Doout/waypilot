@@ -53,8 +53,16 @@ def main():
         process = subprocess.run([os.environ["WAYPILOT_PYTHON"], str(demo), str(binary)], env=environment, capture_output=True, text=True, timeout=45, check=True)
         live = json.loads(process.stdout)
         assert [case["upstream_calls"] for case in live["workflow"]] == [4, 0, 2]
+        from state_support import Client, StateDemo
+        with StateDemo(binary, environment=environment) as state_demo:
+            client = Client(state_demo.base, state_demo.token)
+            client.call("waypilot__state", {})
+            client.call("waypilot__state", {})
+            state_demo.mutate(key="a", touch=True)
+            client.call("waypilot__state", {})
+            client.close()
         names = {span["name"] for span in spans}
-        required = {"waypilot.run", "waypilot.fragment", "mcp.prewarm", "mcp.tool", "workflow.node", "gateway.http", "mcp.gateway.request", "mcp.prepare", "mcp.invoke"}
+        required = {"waypilot.run", "waypilot.fragment", "mcp.prewarm", "mcp.tool", "workflow.node", "gateway.http", "mcp.gateway.request", "mcp.prepare", "mcp.invoke", "mcp.state.validate", "waypilot.cache.lookup"}
         assert required <= names, f"missing spans: {required - names}; stderr: {process.stderr[-2000:]}"
         dispositions = {
             attr["value"].get("stringValue")

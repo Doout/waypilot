@@ -133,6 +133,9 @@ pub struct ToolRule {
     pub cache_ttl_ms: u64,
     #[serde(default)]
     pub reusable: bool,
+    /// Opt-in state contract; validator is called with the original tool name and arguments.
+    #[serde(default)]
+    pub state_tool: Option<String>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -300,6 +303,18 @@ impl Config {
             );
             server.endpoint.validate()?;
             for (tool, rule) in &server.tools {
+                if let Some(validator) = &rule.state_tool {
+                    ensure!(
+                        server
+                            .tools
+                            .get(validator)
+                            .is_none_or(|rule| rule.state_tool.is_none()),
+                        "state validators cannot require another state validator"
+                    );
+                    ensure!(rule.reusable && validator != tool && !validator.is_empty()
+                        && validator.len() <= 128 && !validator.chars().any(char::is_control),
+                        "state validation requires an explicit reusable tool and a distinct validator");
+                }
                 ensure!(
                     !tool.is_empty()
                         && tool.len() <= 128
