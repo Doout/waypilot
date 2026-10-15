@@ -377,7 +377,11 @@ async fn branch(work: Arc<Work>, role: &'static str) -> Result<Branch, Error> {
                 value = work
                     .shared
                     .pool
-                    .call(role, tool, value, deadline)
+                    .call_checked(role, tool, value, deadline, || {
+                        work.permit
+                            .check()
+                            .map_err(|_| anyhow::anyhow!("tool access revoked"))
+                    })
                     .await
                     .map_err(|_| Error::Failed("mcp_call_failed"))?;
             }

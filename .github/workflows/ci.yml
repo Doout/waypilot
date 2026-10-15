@@ -18,6 +18,8 @@ jobs:
           python-version: '3.13'
       - name: Install Rust
         run: rustup toolchain install 1.99.0 --profile minimal --component rustfmt --component clippy
+      - name: Install independent MCP SDK
+        run: python3 -m pip install -r requirements-dev.txt
       - name: Verify
         run: |
           export WAYPILOT_PYTHON="$(command -v python3)"
@@ -26,7 +28,12 @@ jobs:
         run: |
           export WAYPILOT_PYTHON="$(command -v python3)"
           cargo run --locked --release -- demo --samples 10 > target/benchmark.json
+          python3 demos/mcp_demo.py target/release/waypilot > target/mcp-demo.json
+          python3 scripts/benchmark_gateway.py target/release/waypilot --samples 100 > target/gateway-benchmark.json
       - uses: actions/upload-artifact@v4
         with:
           name: benchmark-${{ matrix.os }}
-          path: target/benchmark.json
+          path: |
+            target/benchmark.json
+            target/mcp-demo.json
+            target/gateway-benchmark.json

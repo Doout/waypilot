@@ -14,11 +14,17 @@ The product hypothesis is that recurring agent work can become faster through sh
 
 This proves mechanics. It does not establish prediction accuracy on diverse workloads, generalized workflow inference or real-model task quality.
 
+## MCP gateway prototype — implemented
+
+The service accepts real MCP calls over HTTP and stdio, forwards to configured local or remote tool servers, and exposes authored workflows as virtual tools. It uses Wayframe graphs, scoped cache/singleflight, supervised processes and telemetry directly. Static authenticated users, tool grants, token buckets, bounded sessions, cancellation, deadline propagation and current-access release checks cover the executable path.
+
+The repeatable demo verifies two parallel MCP branches, a synchronous join, four/zero/two tool-call counts, preparation without invocation, a mutable counter that never reuses results, and optional live Microsoft Learn tool calls. Linux/macOS CI uses owned JSON/SSE and stdio peers plus the independent official Python MCP SDK. This is a working MCP service, not automatic workflow compilation or speculative tool execution. See [operations](gateway.md) for supported transports and limits.
+
 ## M1: Explicit contracts and incremental fragments
 
 Waypilot: versioned tool catalog, pure/read/write/unknown effect declarations, argument bindings, resource read/write sets, privacy/disclosure eligibility, validity witnesses and fragment output schemas. Begin with operator-approved contracts. Keep unknown tools ordered and ineligible for speculation/reuse. Add nested fragments, branch selectors and resource-driven invalidation. Avoid persisting identities or secrets in learned profiles.
 
-Wayframe: a small transport-neutral reuse store with typed outputs, application-supplied scope keys, dependency revisions, expiry/byte budgets and explicit validation outcomes. Retain authorization outside it. Start with a standalone crate; integrate with flow boundaries only after the semantics are exercised.
+Wayframe: build dependency witnesses and selective invalidation on the existing `wayframe-cache` typed store, canonical scope keys, expiry/byte budgets and singleflight. The prototype already consumes those APIs. Retain authorization outside stored results; add graph-level fragment boundaries only after the new semantics are exercised.
 
 Acceptance: mutate one nested dependency, tool implementation, selector and permission independently; only valid reusable computations survive, every control still executes, and wrong-scope reuse is zero. Include an equivalent non-agent data-processing fixture.
 
@@ -42,7 +48,7 @@ Acceptance: held-out branches and new argument values, changed tool schemas, mod
 
 ## M4: Dynamic continuations and recoverable execution
 
-Waypilot: an adapter contract for existing agents to submit/observe tool calls, results and continuation boundaries. Network gateway mode covers visible calls; SDK hooks expose in-process work. Begin with one integration and publish its coverage limits. Add HTTP MCP after stdio lifecycle qualification; add custom transport adapters through the same tool contract rather than treating every network protocol as MCP.
+Waypilot: an adapter contract for existing agents to submit/observe tool calls, results and continuation boundaries. Network gateway mode covers visible calls; SDK hooks expose in-process work. Begin with one integration and publish its coverage limits. The prototype already supports HTTP MCP. Extend qualification to agent adapters, richer session lifecycles and other transport capabilities through explicit contracts rather than treating every network protocol as MCP.
 
 Wayframe: append a validated immutable execution region after previous results determine new work. Inherit the original deadline, budgets and mandatory controls. Store stable execution IDs and outcomes for resume. Never silently expand an existing region's permissions or mutate a running graph in place.
 

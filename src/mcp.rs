@@ -223,7 +223,24 @@ impl Pool {
         value: Value,
         deadline: Instant,
     ) -> Result<Value> {
+        self.call_checked(role, tool, value, deadline, || Ok(()))
+            .await
+    }
+
+    pub async fn call_checked<F>(
+        &self,
+        role: &'static str,
+        tool: &'static str,
+        value: Value,
+        deadline: Instant,
+        check: F,
+    ) -> Result<Value>
+    where
+        F: Fn() -> Result<()> + Send + Sync,
+    {
         let session = self.session(role, deadline).await?;
+        check()?;
+        ensure!(Instant::now() < deadline, "tool dispatch deadline exceeded");
         self.counters.calls.fetch_add(1, Ordering::Relaxed);
         let result = session
             .request(

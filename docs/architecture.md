@@ -1,53 +1,66 @@
 # Architecture
 
-## Current executable slice
+## MCP gateway
 
 ```mermaid
 flowchart LR
-    A[Immutable project snapshot] --> G[Authorize]
-    G --> D[Dependencies fragment]
-    G --> S[Source fragment]
+    C[MCP client: HTTP or stdio] --> A[Authenticate and bind session]
+    A --> L[Admission, deadline and current grants]
+    L --> G[Wayframe execution graph]
+    G --> D[Dependency tools]
+    G --> S[Source tools]
     D --> J[Synchronous collection]
     S --> J
     J --> R[Recheck current access]
-    R --> O[Release outputs]
+    R --> O[MCP ToolResult]
+    D <--> V[Scoped exact result store]
+    S <--> V
+    D --> U[Local stdio or remote HTTP MCP]
+    S --> U
 ```
 
-Each fragment first checks its exact-key result store. On a miss it invokes two MCP tools in sequence; the fragments may run concurrently. Tool inputs are immutable supplied content. The example does not read a changing repository or query a live package registry. There is no hidden mutable-resource freshness claim.
+A direct tool call uses a compiled authorize → invoke → authorize-release graph. An authored virtual tool uses an immutable DAG compiled from configured argument bindings. Independent steps can run concurrently, previous results feed later steps, and a synchronous join collects selected outputs before release. All configured steps execute; selecting fewer output fields does not silently remove effects.
 
-The graph is compiled once for an engine. An engine owns its cache, profile and two MCP sessions. A new configuration generation creates another engine. Cache entries are not serialized or shared across engines.
+`src/config.rs` owns trusted configuration and structural validation. `src/gateway.rs` owns identities, sessions, rate limits, prewarming and reuse; `gateway/http.rs` and `gateway/stdio.rs` own ingress lifecycles. `src/upstream.rs` owns MCP negotiation, catalogs and stdio/HTTP clients. `src/workflow.rs` translates authored bindings into Wayframe graphs.
+
+Every downstream session has separate upstream clients. Each client serializes its own connection operations; distinct servers and downstream sessions can run concurrently. Per-request admission, per-session job caps and separate prewarm admission bound active work. Operator-selected stdio principals use the same controls as HTTP users.
 
 ## Ownership
 
 | Wayframe | Waypilot |
 | --- | --- |
-| Typed graph dependencies, choices and joins | Tool contracts, argument provenance and fragment semantics |
+| Typed graph dependencies, choices and joins | Tool contracts, argument provenance and MCP workflow semantics |
 | Mandatory gates and fixed execution deadlines | Identity projection and current tool/reuse authorization |
-| Bounded scheduling and node timings | Prediction confidence, speculative eligibility and value estimates |
-| Supervised process and network boundaries | MCP initialization, catalog validation and session compatibility |
-| Generic optional trace export | Agent-specific span fields and qualification reports |
-| Future typed reuse and lease primitives | Resource freshness rules and invalidation sources |
+| Bounded scheduling and node timings | Prediction confidence and preparation eligibility |
+| Supervised process transport | MCP initialization, HTTP/SSE parsing and session compatibility |
+| Generic typed cache, TTL/byte bounds and singleflight | Scope keys, operator freshness contracts and invalidation triggers |
+| Generic optional trace export | MCP-specific span fields and qualification reports |
+| Future work leases and continuation primitives | Resource witnesses, agent adapters and speculative promotion policy |
 
-## Result validity
+The gateway consumes public crates from a pinned framework commit. No Wayframe code change was necessary for this prototype. Future extraction requires both a working Waypilot scenario and a non-agent use case.
 
-The current cache key hashes identity scope (tenant and subject), authored contract revision, fixture implementation digest, fragment identity and exact relevant input bytes. The cache has a 128-entry and 4 MiB serialized-data budget, LRU eviction and TTL expiry. Memory allocator overhead is not included in the byte estimate. A different source input produces a new source key; the dependency key stays usable. Old versions are bounded and eventually expire or are evicted.
+## Validity and controls
 
-Successful explicitly reusable data computations may be retained. Authorization decisions, mandatory gates and required external effects are never retained as computation results. Each run checks current authorization; revocation during I/O prevents later calls and release. Already issued I/O cannot be unsent.
+Gateway reuse keys hash tenant, subject, grants, global generation, server ID, operator contract revision, catalog digest, tool and exact arguments. Entries have a 512-entry/16 MiB accounted payload budget, LRU eviction and TTL expiry. Accounted bytes exclude allocator/object overhead. Retained values are process-local; same-key misses use the framework's bounded singleflight guard.
 
-Later mutable-resource support needs an explicit validity witness: immutable object revision, reliable resource version/change notification, or a declared bounded-staleness policy. A TTL limits retention; it does not prove that an external value is current. A branch's dependency vector must include selectors, session state, tool versions and any hidden dependencies exposed by its contract. Unknown effects or dependencies make a candidate ineligible for automatic reordering or result reuse.
+Only explicit reusable-tool contracts enable retention. Authorization decisions, gates and required external effects are not retained as computation results. Every child tool checks current grants, including after waiting for connection preparation, and release rechecks the root and child grants. An administrative update changes the generation, invalidates retained results and prevents earlier-generation work from releasing results. Disabling a user additionally cancels their sessions.
 
-## Prediction and prewarming
+The owned workflow uses immutable manifest and source content. Changing the source argument produces new keys for its two tools; unchanged dependency results remain reusable. The gateway retains each tool result individually, while the original fixture engine retains its complete two-tool branches. A derived result receives the previous tool's exact structured output as its input. This establishes exact-input incremental behavior, not generalized dependency inference or mutable-resource freshness.
 
-The first predictor is a fixed-workload frequency baseline over successfully released fragment/server use. It needs at least two successful runs, predicts server use seen in at least half of those runs, and has only two configured roles. Profiles contain aggregate counts and a generation revision; invalid or foreign profiles are rejected. There is no natural-language intent router, learned dependency graph or trained model.
+A TTL bounds retention; it does not prove current external state. Session-independent behavior, hidden dependencies, selectors, tool implementations and resource versions belong in an operator's validity contract. Mutable external tools remain ineligible by default. A future dependency witness must identify an immutable resource revision, reliable change signal or explicitly accepted staleness policy.
 
-Prewarming starts the process, negotiates MCP initialization, sends the initialized notification and validates the expected tool catalog. It does not issue `tools/call`. The fixture is operator-owned; its pure behavior is an authored contract, not something inferred from a server's `readOnlyHint`.
+## Prewarming and cancellation
 
-## Cancellation and sharing boundary
+The gateway learns per-user server-use frequency from successfully released tool results. After two observations it can prepare up to two permitted, opted-in environments on a new HTTP session. Preparation negotiates MCP, sends the initialized notification and validates the catalog. It issues no `tools/call`; initialization can still be visible to the remote service. Profiles are aggregate in-memory counts, not stored prompts, arguments or learned workflow structure.
 
-Current MCP environments contain no tenant credentials or tenant state. Production session pools must be keyed by compatible credentials, tenant, server, protocol and environment revisions. Arbitrary sessions cannot be pooled across identities.
+Cancellation is local control, not rollback. An invocation owns its connection while I/O is pending. Dropping that future discards the connection; a subsequent distinct invocation can initialize afresh, while the failed call is never replayed automatically. Already-issued HTTP effects may finish at the server. Stdio cancellation invalidates that subprocess, which is why unrelated requests cannot share an active stdio exchange.
 
-Wayframe's current stdio transport invalidates a subprocess when an outstanding response is abandoned. Waypilot therefore does not detach speculative calls or attach independent consumer leases to shared in-flight work yet. A disconnected engine fails closed and requires a new generation; it does not automatically retry a tool call. Speculative execution will initially own separate bounded environments so canceling a prediction cannot terminate an authoritative call's process.
+Singleflight serializes same-key eligible work; it does not create detached speculative tasks or independent consumer leases. A leader's successful retained result may satisfy a follower after current checks. Failed leaders store no result, so an authoritative follower can perform its own eligible read. General shared execution, independent cancellation ownership and speculative result promotion remain separate milestones.
 
-An engine currently admits one authoritative run at a time and rejects overlapping runs. Independent branches inside that run still execute concurrently. This prevents cancellation of one run from terminating a process used by another run before independent session/consumer leases exist.
+See [gateway operations](gateway.md) for transport coverage, exact limits and hosting behavior.
 
-Current counters describe aggregate engine activity, including prewarming. Per-request resource accounting, robust session replacement, per-consumer cancellation and durable recovery belong to later milestones. Restarting an engine currently discards its retained results; the aggregate prediction profile is explicitly exportable.
+## Retained fixture baseline
+
+The original `Engine` in `src/runtime.rs` remains a small embedding and benchmark harness. It owns two fixture-only MCP sessions, a bounded 128-entry/4 MiB branch store, and a generation-validated exportable frequency profile. One authoritative run is admitted per engine; its two branches can execute concurrently. Its `Permit` is a test/embedding control rather than network authentication.
+
+That harness compares serial, parallel and learned prewarming execution with the same immutable fixture outputs. It deliberately fails closed after a disconnected process and requires a new engine; the general gateway's client replacement applies to subsequent distinct gateway invocations. Both paths check access after preparation and before dispatch. Keeping the baseline makes optimization costs and behavioral regressions measurable without adding an agent or model dependency.

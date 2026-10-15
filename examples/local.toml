@@ -1,0 +1,63 @@
+listen = "127.0.0.1:7400"
+admin_token_env = "WAYPILOT_ADMIN_TOKEN"
+request_timeout_ms = 10000
+
+[[users]]
+id = "developer"
+tenant = "local"
+token_env = "WAYPILOT_TOKEN"
+tools = ["deps__*", "source__*", "waypilot__inspect"]
+requests_per_second = 50
+burst = 100
+
+[[servers]]
+id = "deps"
+revision = "owned-fixture-v1"
+prewarm = true
+[servers.endpoint]
+transport = "stdio"
+command = "env:WAYPILOT_PYTHON"
+args = ["{config_dir}/../fixtures/tools.py", "--role", "dependencies", "--boot-ms", "60", "--call-ms", "15"]
+[servers.tools.parse_manifest]
+reusable = true
+cache_ttl_ms = 60000
+[servers.tools.dependency_index]
+reusable = true
+cache_ttl_ms = 60000
+
+[[servers]]
+id = "source"
+revision = "owned-fixture-v1"
+prewarm = true
+[servers.endpoint]
+transport = "stdio"
+command = "env:WAYPILOT_PYTHON"
+args = ["{config_dir}/../fixtures/tools.py", "--role", "source", "--boot-ms", "60", "--call-ms", "15"]
+[servers.tools.parse_source]
+reusable = true
+cache_ttl_ms = 60000
+[servers.tools.source_index]
+reusable = true
+cache_ttl_ms = 60000
+
+[[workflows]]
+name = "inspect"
+description = "Inspect immutable manifest and source snapshots through two MCP tool branches"
+input_schema = { type = "object", properties = { manifest = { type = "string" }, source = { type = "string" } }, required = ["manifest", "source"] }
+outputs = ["dependencies", "source-index"]
+[[workflows.steps]]
+id = "manifest"
+tool = "deps__parse_manifest"
+arguments = { value = { input = "/manifest" } }
+[[workflows.steps]]
+id = "dependencies"
+tool = "deps__dependency_index"
+arguments = { value = { step = "manifest", pointer = "/structuredContent" } }
+[[workflows.steps]]
+id = "source"
+tool = "source__parse_source"
+arguments = { value = { input = "/source" } }
+[[workflows.steps]]
+id = "source-index"
+tool = "source__source_index"
+arguments = { value = { step = "source", pointer = "/structuredContent" } }

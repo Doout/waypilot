@@ -1,0 +1,22 @@
+listen = "127.0.0.1:7400"
+admin_token_env = "WAYPILOT_ADMIN_TOKEN"
+request_timeout_ms = 60000
+
+[[users]]
+id = "developer"
+tenant = "local"
+token_env = "WAYPILOT_TOKEN"
+tools = ["learn__*"]
+requests_per_second = 2
+burst = 10
+
+[[servers]]
+id = "learn"
+revision = "operator-reviewed-live-service-v1"
+prewarm = true
+[servers.endpoint]
+transport = "http"
+url = "https://learn.microsoft.com/api/mcp"
+
+# Result reuse is disabled. This server serves mutable public documentation.
+# Static bearer credentials for another server can use endpoint.bearer_env.

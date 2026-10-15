@@ -42,8 +42,12 @@ def main():
         benchmark = json.loads(process.stdout)
         assert benchmark["output_equivalence"] is True
         assert benchmark["incremental"]["repeat"]["counts"]["calls"] == 0
+        demo = Path(__file__).resolve().parents[1] / "demos/mcp_demo.py"
+        process = subprocess.run([os.environ["WAYPILOT_PYTHON"], str(demo), str(binary)], env=environment, capture_output=True, text=True, timeout=45, check=True)
+        live = json.loads(process.stdout)
+        assert [case["upstream_calls"] for case in live["workflow"]] == [4, 0, 2]
         names = {span["name"] for span in spans}
-        required = {"waypilot.run", "waypilot.fragment", "mcp.prewarm", "mcp.tool", "workflow.node"}
+        required = {"waypilot.run", "waypilot.fragment", "mcp.prewarm", "mcp.tool", "workflow.node", "gateway.http", "mcp.gateway.request", "mcp.prepare", "mcp.invoke"}
         assert required <= names, f"missing spans: {required - names}; stderr: {process.stderr[-2000:]}"
         dispositions = {
             attr["value"].get("stringValue")
@@ -55,7 +59,12 @@ def main():
         assert all(int(span["endTimeUnixNano"]) >= int(span["startTimeUnixNano"]) for span in spans)
         assert all(span.get("traceId") and span.get("spanId") for span in spans)
         assert any(span["name"] == "mcp.tool" and span.get("parentSpanId") for span in spans)
-        print(json.dumps({"otel_export": "passed", "spans": len(spans), "required_names": sorted(required), "dispositions": sorted(dispositions)}))
+        gateway_traces = {span["traceId"] for span in spans if span["name"] == "gateway.http"}
+        assert any(span["name"] == "mcp.invoke" and span["traceId"] in gateway_traces and span.get("parentSpanId") for span in spans)
+        timings = {"node.dependency_wait_ns", "node.scheduler_wait_ns", "node.execution_ns"}
+        timed_nodes = [span for span in spans if span["name"] == "workflow.node" and timings <= {attr["key"] for attr in span.get("attributes", [])}]
+        assert timed_nodes, "graph node wait/execution timings were not exported"
+        print(json.dumps({"otel_export": "passed", "spans": len(spans), "required_names": sorted(required), "dispositions": sorted(dispositions), "timed_graph_nodes": len(timed_nodes), "gateway_to_upstream_parentage": "passed"}))
     finally:
         collector.shutdown()
         thread.join(timeout=5)

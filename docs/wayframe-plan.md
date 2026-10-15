@@ -8,13 +8,15 @@ Reviewed against Wayframe commit `ec4d27224ec213eabc2eae9b474b522d1cab8874`.
 
 `wayframe-runtime` supplies embedded pipeline/adaptive execution. `wayframe-transport` supplies supervised stdio processes and explicit policy transport bridges. Its policy envelopes are not a generic distributed task protocol. `wayframe-observability` supplies optional OTLP export.
 
-Waypilot M0 uses these public crates without changing Wayframe. It is an external consumer with a pinned Git dependency, not a copied scheduler or a second framework implementation.
+`wayframe-cache` already supplies a typed bounded result store, canonical scoped keys, generation invalidation and singleflight guards. The live MCP gateway uses it directly.
+
+Waypilot uses these public crates without changing Wayframe. It is an external consumer with a pinned Git dependency, not a copied scheduler or a second framework implementation.
 
 ## Proposed additions
 
 | Priority | Primitive and likely home | Required semantics and validation |
 | --- | --- | --- |
-| 1 | Optional typed dependency/reuse store; new `wayframe-reuse` crate initially | Explicit generation/scope/dependency keys; typed immutable outputs; entry/byte/TTL bounds; selective invalidation; validation reasons. No stored authorization results and no automatic eligibility inferred from graph shape. Test nested dependencies, revision changes, collisions, eviction and concurrency. |
+| 1 | Dependency witnesses and selective invalidation; extend `wayframe-cache` | Reuse its existing typed store, canonical scope/generation keys, entry/byte/TTL bounds and singleflight. Add explicit dependency revision vectors and validation reasons only when a working scenario requires them. No stored authorization results or inferred eligibility. Test nested dependencies, revision changes, eviction and concurrency. |
 | 2 | Work leases and admission; `wayframe-runtime` | Separate authoritative/speculative budgets, bounded pending work, reference-counted consumers, individual deadlines, cancellation ownership and explicit promotion. Test one consumer leaving, all consumers leaving, fairness and capacity saturation. |
 | 2 | Session lifecycle; `wayframe-transport` | Model process/session readiness, configuration/credential compatibility, drain, shutdown and replacement. Current `stdio::Pending::drop` cancels the whole process when a response is still pending: do not share such a speculative exchange with committed work. Preserve fail-closed behavior until per-call cancellation is qualified. |
 | 3 | Reusable fragment boundary; `wayframe-flow` | Keep entry and release gates outside retained data results. Preserve current selector and deadline checks. Expose executed/reused/joined/invalidated dispositions without treating an omitted control as a cache hit. Test nested graph controls and synchronous work after joins. |
@@ -43,4 +45,4 @@ These names are design proposals, not committed public APIs. Build the smallest 
 5. Pin the committed candidate revision in Waypilot and run integration, trace and baseline checks.
 6. Land the framework change, update the dependency pin and record qualification evidence in both repositories.
 
-No framework code change is required merely to create this initial executable slice. The M1 dependency/reuse primitive is the first planned extraction.
+No framework code change is required for the current MCP gateway. Existing cache, graph, transport and telemetry APIs cover this prototype. Dependency witnesses and work leases are the next candidate extensions; do not introduce a duplicate reuse crate.

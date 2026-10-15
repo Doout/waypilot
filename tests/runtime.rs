@@ -146,7 +146,29 @@ async fn revocation_during_io_prevents_followup_tools_and_release() {
     let execution = engine.run(actor.clone(), project(), budget());
     let revoke = async {
         tokio::time::timeout(budget(), async {
-            while engine.counts().calls < 2 {
+            while engine.counts().calls == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        actor.revoke();
+        engine.counts().calls
+    };
+    let (result, issued) = tokio::join!(execution, revoke);
+    assert!(result.is_err());
+    assert!((1..=2).contains(&issued));
+    assert_eq!(engine.counts().calls, issued);
+}
+
+#[tokio::test]
+async fn revocation_during_preparation_prevents_first_dispatch() {
+    let engine = Engine::new(fixture(100, 0), Settings::default()).unwrap();
+    let actor = permit("a", "alice");
+    let execution = engine.run(actor.clone(), project(), budget());
+    let revoke = async {
+        tokio::time::timeout(budget(), async {
+            while engine.counts().spawned == 0 {
                 tokio::task::yield_now().await;
             }
         })
@@ -156,7 +178,7 @@ async fn revocation_during_io_prevents_followup_tools_and_release() {
     };
     let (result, ()) = tokio::join!(execution, revoke);
     assert!(result.is_err());
-    assert_eq!(engine.counts().calls, 2);
+    assert_eq!(engine.counts().calls, 0);
 }
 
 #[tokio::test]

@@ -1,0 +1,2 @@
+# Independent official MCP client for interoperability qualification.
+mcp==2.0.1

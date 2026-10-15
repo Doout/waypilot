@@ -1,6 +1,14 @@
 # Benchmark and qualification strategy
 
-## M0 workload
+## Live MCP forwarding overhead
+
+`scripts/benchmark_gateway.py` starts an owned Streamable HTTP server and compares direct MCP echo calls against calls routed through the release gateway. Each mode uses the same caller, upstream, arguments and output assertions. Sessions are initialized, three warmup calls run, and direct/gateway order alternates. Result reuse is disabled, upstream call counts must match the sample count, and the user token bucket is set to 10,000 tokens/second with a 10,000-token burst so it does not shape this sequential workload.
+
+JSON and SSE upstream modes are measured separately. Output includes all trials, nearest-rank p50/p95 and the difference between gateway and direct medians. This is end-to-end local forwarding overhead, including the Python caller's HTTP/JSON work, gateway controls/graph and another HTTP exchange. It is not isolated Rust dispatch cost, a throughput/load benchmark, an HTTP/2 multiplexing test or a remote network latency claim. The owned Python HTTP server closes each HTTP/1.0 connection; both paths use that same server behavior.
+
+Trace export is off unless explicitly configured through the environment. Run a separate trace-enabled comparison before making exporter-overhead claims. Do not subtract p95 values to infer a p95 overhead distribution; raw paired samples are available for further analysis.
+
+## Fixture optimization workload
 
 Two MCP servers run local deterministic tools over immutable content snapshots. Each server has two dependent calls; the two server branches are independent. A server starts with a 60 ms fixture delay, each tool has a 15 ms fixture delay, and a 100 ms simulated reasoning gap precedes authoritative work. Real subprocess startup, MCP handshake, serialization, scheduling, tracing and cache operations remain measured.
 

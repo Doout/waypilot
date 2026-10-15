@@ -24,12 +24,164 @@ async fn main() -> Result<()> {
     let _telemetry = wayframe_observability::init()?;
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
-        Some("demo") => {}
+        Some("demo") => fixture_demo(args).await,
+        Some("serve") | Some("serve-stdio") => {
+            let stdio = std::env::args().nth(1).as_deref() == Some("serve-stdio");
+            let mut config = None;
+            let mut user = None;
+            let mut listen = None;
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--config" => {
+                        config = Some(PathBuf::from(args.next().context("--config needs a file")?))
+                    }
+                    "--user" => user = Some(args.next().context("--user needs an ID")?),
+                    "--listen" => {
+                        listen = Some(args.next().context("--listen needs an address")?.parse()?)
+                    }
+                    _ => bail!("unknown argument: {arg}"),
+                }
+            }
+            let mut config = waypilot::config::Config::load(&config.context("provide --config")?)?;
+            if let Some(listen) = listen {
+                config.listen = listen;
+            }
+            let listen = config.listen;
+            let gateway = waypilot::gateway::Gateway::new(config)?;
+            if stdio {
+                return waypilot::gateway::serve_stdio(
+                    gateway,
+                    &user.context("stdio requires --user")?,
+                )
+                .await;
+            }
+            let listener = tokio::net::TcpListener::bind(listen).await?;
+            println!(
+                "{}",
+                json!({"listen":listener.local_addr()?.to_string(),"transport":"streamable_http"})
+            );
+            let shutdown = gateway.clone();
+            axum::serve(listener, gateway.router())
+                .with_graceful_shutdown(async move {
+                    shutdown_signal().await;
+                    shutdown.shutdown().await;
+                })
+                .await?;
+            Ok(())
+        }
+        Some(command @ ("list" | "call")) => {
+            let mut url = None;
+            let mut token_env = None;
+            let mut tool = None;
+            let mut arguments = json!({});
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--url" => url = Some(args.next().context("--url needs an endpoint")?),
+                    "--token-env" => {
+                        token_env = Some(args.next().context("--token-env needs a name")?)
+                    }
+                    "--tool" => tool = Some(args.next().context("--tool needs a name")?),
+                    "--args" => {
+                        arguments =
+                            serde_json::from_str(&args.next().context("--args needs JSON")?)?
+                    }
+                    _ => bail!("unknown argument: {arg}"),
+                }
+            }
+            ensure!(arguments.is_object(), "--args must be an object");
+            let client = waypilot::upstream::Client::new(waypilot::upstream::Endpoint::Http {
+                url: url.context("provide --url")?,
+                bearer_env: token_env,
+                allow_insecure_http: false,
+            })?;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+            let result = if command == "list" {
+                json!({"tools":client.catalog(deadline).await?.tools})
+            } else {
+                client
+                    .call(&tool.context("provide --tool")?, arguments, deadline)
+                    .await?
+            };
+            println!("{}", serde_json::to_string_pretty(&result)?);
+            client.close().await;
+            Ok(())
+        }
+        Some("admin") => {
+            let mut url = None;
+            let mut token_env = None;
+            let mut action = "stats".to_string();
+            let mut user = None;
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--url" => url = Some(args.next().context("--url needs a base URL")?),
+                    "--token-env" => {
+                        token_env = Some(args.next().context("--token-env needs a variable name")?)
+                    }
+                    "--action" => {
+                        action = args
+                            .next()
+                            .context("--action needs stats, users, invalidate, enable or disable")?
+                    }
+                    "--user" => user = Some(args.next().context("--user needs an ID")?),
+                    _ => bail!("unknown argument: {arg}"),
+                }
+            }
+            let base = url.context("provide --url")?;
+            waypilot::upstream::Endpoint::Http {
+                url: base.clone(),
+                bearer_env: None,
+                allow_insecure_http: false,
+            }
+            .validate()?;
+            let token = std::env::var(token_env.context("provide --token-env")?)?;
+            let client = reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .no_proxy()
+                .timeout(Duration::from_secs(10))
+                .build()?;
+            let request = match action.as_str() {
+                "stats" => client.get(format!("{}/admin/stats", base.trim_end_matches('/'))),
+                "users" => client.get(format!("{}/admin/users", base.trim_end_matches('/'))),
+                "invalidate" => {
+                    client.post(format!("{}/admin/invalidate", base.trim_end_matches('/')))
+                }
+                "enable" | "disable" => client
+                    .post(format!("{}/admin/users/update", base.trim_end_matches('/')))
+                    .json(
+                        &json!({"id":user.context("provide --user")?,"enabled":action == "enable"}),
+                    ),
+                _ => bail!("unknown administrative action"),
+            };
+            let response = request.bearer_auth(token).send().await?;
+            ensure!(
+                response.status().is_success(),
+                "administrative HTTP status {}",
+                response.status().as_u16()
+            );
+            let result: Value = response.json().await?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+            Ok(())
+        }
         _ => {
-            println!("Usage: waypilot demo --python /absolute/path/python3 [--samples 5]\n\nRuns real local MCP subprocesses with simulated tool and model delays.\nWrites raw benchmark JSON to stdout and tracing to stderr.");
-            return Ok(());
+            println!("Waypilot MCP runtime\n\n  serve --config FILE [--listen 127.0.0.1:7400]\n  serve-stdio --config FILE --user ID\n  list --url URL [--token-env NAME]\n  call --url URL [--token-env NAME] --tool NAME --args JSON\n  admin --url BASE --token-env NAME --action stats|users|invalidate|enable|disable [--user ID]\n  demo --python /absolute/path/python3 [--samples 5]\n\nHTTP clients use Streamable HTTP. Logs and traces go to stderr.");
+            Ok(())
         }
     }
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("signal handler");
+        tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = terminate.recv() => {} }
+    }
+    #[cfg(not(unix))]
+    let _ = tokio::signal::ctrl_c().await;
+}
+
+async fn fixture_demo(mut args: impl Iterator<Item = String>) -> Result<()> {
     let mut python = std::env::var_os("WAYPILOT_PYTHON").map(PathBuf::from);
     let mut samples = 5usize;
     while let Some(arg) = args.next() {
