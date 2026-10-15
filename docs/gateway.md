@@ -105,7 +105,8 @@ checks, not a distributed snapshot, remote rollback, or a guarantee that the res
 change after the final observation. A workflow with external effects may fail after an effect
 has occurred; the gateway does not undo it.
 
-Users need grants for both the read tool and its validator. Validator calls consume tokens
+Validators cannot themselves have a `state_tool`. Users need grants for both the read tool
+and its validator. Validator calls consume tokens
 and upstream admission, use current authorization, and share the original request deadline.
 Responses retain at most 64 distinct validation observations; their arguments and version
 maps share the workflow's 1 MiB retained-data budget. Each map permits 1 to 64 resource/version

@@ -125,10 +125,10 @@ Timed trials begin with an external mutation and finish before TTL expiry.
 
 | Mode | p50 / p95 / p99, ms | Stale results / 100 | Business / validation calls |
 | --- | --- | ---: | ---: |
-| Baseline TTL | 1.09 / 1.58 / 2.15 | 100 | 0 / 0 |
-| Baseline uncached | 53.56 / 59.61 / 66.75 | 0 | 400 / 0 |
-| Candidate TTL | 0.91 / 1.95 / 3.48 | 100 | 0 / 0 |
-| Candidate validated | 4.64 / 34.79 / 45.35 | 0 | 40 / 600 |
+| Baseline TTL | 0.62 / 1.22 / 1.29 | 100 | 0 / 0 |
+| Baseline uncached | 51.55 / 55.51 / 58.14 | 0 | 400 / 0 |
+| Candidate TTL | 0.66 / 1.31 / 1.65 | 100 | 0 / 0 |
+| Candidate validated | 3.71 / 30.04 / 33.44 | 0 | 40 / 600 |
 
 Validated reuse avoided 90% of business calls while increasing total MCP calls from 400
 to 640. The low TTL timings return stale data and are not equivalent optimizations.
@@ -137,9 +137,9 @@ Raw trials, CPU and sampled RSS are in `target/remote-state/benchmark.json`.
 The same candidate passed all 4,000 state-workflow responses with 1,000 connected clients,
 500 pending calls and a 64-call upstream limit. Warm runs issued zero business calls;
 each single-branch change recomputed two nodes. Warm request p50/p95/p99 was
-124.74/128.91/129.31 ms in the paced burst workload. Post-phase gateway RSS samples reached
-149.67 MiB. Raw phases are in `target/remote-state/state-scale.json`.
+109.33/114.37/115.46 ms in the paced burst workload. Post-phase gateway RSS samples reached
+139.92 MiB. Raw phases are in `target/remote-state/state-scale.json`.
 The ordinary 1,000-client/500-concurrency qualification also passed with 10 seconds of
-500-call/second offered load and 10% tracing; its sampled peak RSS was 304.66 MiB.
+500-call/second offered load and 10% tracing; its sampled peak RSS was 327.61 MiB.
 That short run does not replace the longer measurements above. Its report is
 `target/remote-state/scale-qualification.json`.

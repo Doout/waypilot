@@ -422,19 +422,26 @@ impl Gateway {
         let rule = server.tools.get(tool);
         let reusable =
             parents.cacheable && rule.is_some_and(|rule| rule.reusable && rule.cache_ttl_ms > 0);
-        let key = Key::new(
-            Scope {
-                tenant: &session.actor.settings.tenant,
-                subject: &session.actor.settings.id,
-                permissions: &session.actor.settings.tools,
-                generation: epoch,
-                route: &server.id,
-            },
-            "tools/call",
-            &format!("{}:{}:{}", server.revision, catalog.revision, tool),
-            &arguments,
-        )
-        .map_err(|_| Fault::invalid())?;
+        let stateful = rule.and_then(|rule| rule.state_tool.as_ref()).is_some();
+        let key = if reusable || stateful {
+            Some(
+                Key::new(
+                    Scope {
+                        tenant: &session.actor.settings.tenant,
+                        subject: &session.actor.settings.id,
+                        permissions: &session.actor.settings.tools,
+                        generation: epoch,
+                        route: &server.id,
+                    },
+                    "tools/call",
+                    &format!("{}:{}:{}", server.revision, catalog.revision, tool),
+                    &arguments,
+                )
+                .map_err(|_| Fault::invalid())?,
+            )
+        } else {
+            None
+        };
         let mut lineage = Lineage {
             cacheable: false,
             receipts: Vec::new(),
@@ -445,12 +452,12 @@ impl Gateway {
                 validator: format!("{server_id}__{validator}"),
                 arguments: json!({"tool":tool,"arguments":arguments}),
                 evidence: Evidence::default(),
-                key: key.clone(),
+                key: key.as_ref().expect("state key").clone(),
             };
             state.evidence = match self.probe_state(&session, &state, deadline, epoch).await {
                 Ok(evidence) => evidence,
                 Err(error) => {
-                    let _ = self.cache.invalidate(&key);
+                    let _ = self.cache.invalidate(&state.key);
                     self.metrics.state_conflicts.fetch_add(1, Ordering::Relaxed);
                     return Err(error);
                 }
@@ -465,6 +472,7 @@ impl Gateway {
             .unwrap_or_default();
         let mut receipt = None;
         let (value, disposition) = if reusable {
+            let key = key.expect("reusable key");
             let lookup = || {
                 tracing::info_span!("waypilot.cache.lookup").in_scope(|| {
                     self.cache
