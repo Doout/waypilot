@@ -13,6 +13,7 @@ import socketserver
 import threading
 import time
 import uuid
+from state import State, TOOLS as STATE_TOOLS
 
 
 TOOLS = [
@@ -34,6 +35,7 @@ def main():
     parser.add_argument("--response", choices=["json", "sse"], default="json")
     parser.add_argument("--call-ms", type=int, default=0)
     args = parser.parse_args()
+    state = State()
     lock = threading.Lock()
     sessions = set()
     counts = {"counter": 0, "calls": 0, "initialize": 0}
@@ -63,6 +65,9 @@ def main():
             self.end_headers()
 
         def do_POST(self):
+            if self.path == "/state":
+                length = int(self.headers.get("Content-Length", "0"))
+                return self.send_json(200, state.control(json.loads(self.rfile.read(length))))
             if self.path != "/mcp":
                 return self.send_error(404)
             length = int(self.headers.get("Content-Length", "0"))
@@ -88,7 +93,7 @@ def main():
                 return
             reply = {"jsonrpc": "2.0", "id": request["id"]}
             if method == "tools/list":
-                reply["result"] = {"tools": TOOLS}
+                reply["result"] = {"tools": TOOLS + STATE_TOOLS}
             elif method == "tools/call":
                 params = request.get("params", {})
                 name = params.get("name")
@@ -96,6 +101,9 @@ def main():
                 with lock:
                     counts["calls"] += 1
                 time.sleep(args.call_ms / 1000)
+                if name in ["state_read", "state_version"]:
+                    reply["result"] = state.call(name, arguments)
+                    return self.send_json(200, reply) if args.response == "json" else self.send_sse(reply)
                 if name == "echo" and isinstance(arguments.get("value"), str):
                     result = {"value": arguments["value"]}
                 elif name == "counter":
@@ -129,6 +137,9 @@ def main():
                 reply["error"] = {"code": -32601, "message": "unsupported method"}
             if args.response == "json":
                 return self.send_json(200, reply)
+            return self.send_sse(reply)
+
+        def send_sse(self, reply):
             # Split UTF-8 and event framing across writes to exercise real streaming.
             body = (": heartbeat\r\n\r\ndata: " + json.dumps(reply) + "\r\n\r\n").encode()
             self.send_response(200)

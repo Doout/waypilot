@@ -35,6 +35,30 @@ async def check(demo):
     return {"sdk": "official mcp==2.0.1", "protocol": "negotiated classic 2025-11-25", "ingress": ["streamable_http", "stdio"], "upstream": ["streamable_http_sse", "stdio"], "workflow": "passed", "result_reuse": "passed"}
 
 
+async def check_state(demo, binary):
+    async def exercise(client):
+        first = (await client.call_tool("waypilot__state", {})).model_dump(by_alias=True)
+        warm = (await client.call_tool("waypilot__state", {})).model_dump(by_alias=True)
+        assert {step["disposition"] for step in warm["structuredContent"]["steps"]} == {"reused"}
+        demo.mutate(key="a", touch=True)
+        changed = (await client.call_tool("waypilot__state", {})).model_dump(by_alias=True)
+        steps = {step["id"]: step["disposition"] for step in changed["structuredContent"]["steps"]}
+        assert steps == {"left": "executed", "left-index": "executed", "right": "reused", "right-index": "reused"}
+        assert first["structuredContent"]["outputs"] == changed["structuredContent"]["outputs"]
+    async with httpx2.AsyncClient(headers={"Authorization": f"Bearer {demo.token}"}, timeout=30) as http:
+        async with SDKClient(streamable_http_client(demo.base + "/mcp", http_client=http)) as client:
+            await exercise(client)
+    parameters = StdioServerParameters(command=str(Path(binary).resolve()), args=["serve-stdio", "--config", str(demo.config), "--user", "reader"], env=demo.env)
+    async with SDKClient(stdio_client(parameters)) as client:
+        await exercise(client)
+
+
 if __name__ == "__main__":
+    from state_support import StateDemo
     with Demo(sys.argv[1], os.environ["WAYPILOT_PYTHON"]) as demo:
-        print(json.dumps(asyncio.run(check(demo))))
+        result = asyncio.run(check(demo))
+    for transport in ["json", "sse", "stdio"]:
+        with StateDemo(sys.argv[1], transport) as state_demo:
+            asyncio.run(check_state(state_demo, sys.argv[1]))
+    result["state_validation_and_branch_invalidation"] = "passed with HTTP and stdio ingress across JSON, SSE and stdio peers"
+    print(json.dumps(result))

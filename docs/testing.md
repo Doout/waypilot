@@ -76,3 +76,70 @@ Forwarding results use 200 trials per response type, with tracing off. The basel
 | SSE | 0.485 / 0.592 | 0.744 / 0.863 | 364 / 259 |
 
 Raw local files are `target/scale-release.json`, `target/scale-release-long.json`, `target/overhead-before.json` and `target/overhead-after.json`. Their JSON includes binary SHA-256, environment and trials. `target/` is ignored by Git. The [Linux/macOS CI run](https://github.com/Doout/waypilot/actions/runs/38743792386) provides independent artifacts for the same source. Linux passed the full target with 30,000 calls at 499.92 calls/second.
+
+## Remote state validation
+
+```sh
+python3 scripts/check_state.py target/debug/waypilot
+python3 load/state_qualify.py target/release/waypilot \
+  --clients 1000 --concurrency 500 --upstream-calls 64 \
+  --output target/state-scale.json
+```
+
+The state suite covers JSON, SSE and stdio reads, unchanged-value version changes,
+descendant invalidation, malformed evidence, cancellation, revocation, deadlines and
+validation rate limits. The scale test keeps 1,000 sessions open and checks every workflow
+result in four phases: cold, warm, a version-only change, and a value change. It issues
+500-call bursts, allowing the documented token budget to refill between waves. Its elapsed
+throughput includes pacing; request latency excludes that refill wait. This is a shared
+identity/cache workload with changes between phases, not a sustained-throughput or atomic
+cross-server snapshot claim. The existing qualification suite separately exercises offered load.
+
+To compare with the exact pre-change code:
+
+```sh
+git worktree add --detach target/state-baseline d6c7e2c
+CARGO_TARGET_DIR="$PWD/target/state-baseline-build" cargo build --locked --release \
+  --manifest-path target/state-baseline/Cargo.toml
+cargo build --locked --release
+python3 scripts/benchmark_state.py target/release/waypilot \
+  --baseline target/state-baseline-build/release/waypilot --samples 100 --read-ms 20 \
+  > target/state-benchmark.json
+```
+
+The benchmark alternates four modes against owned HTTP peers: baseline TTL reuse, baseline
+uncached execution, candidate TTL reuse, and candidate validated reuse. Each workflow has two
+reads and two descendants. One resource changes outside the gateway every five requests.
+An independent fingerprint oracle checks outputs; stale TTL hits are recorded, while any
+incorrect validated or uncached result fails the run. Initialization is excluded. Reports
+include binary hashes, raw timings, p50/p95/p99, business and validation calls, gateway CPU,
+and RSS sampled after requests. CI uses the same candidate binary for the control modes;
+the separate-binary comparison above measures code changes against `d6c7e2c`.
+
+Validation adds real upstream calls. Compare their cost with the expensive work avoided;
+a smaller count of business calls alone does not establish a net efficiency gain.
+
+Recorded locally on 2026-10-15, Apple M2 Max, release builds, 100 trials and 20 ms owned
+read delays. Baseline source is `d6c7e2c`; the candidate pins Wayframe `2e1ed6f`.
+Timed trials begin with an external mutation and finish before TTL expiry.
+
+| Mode | p50 / p95 / p99, ms | Stale results / 100 | Business / validation calls |
+| --- | --- | ---: | ---: |
+| Baseline TTL | 0.62 / 1.22 / 1.29 | 100 | 0 / 0 |
+| Baseline uncached | 51.55 / 55.51 / 58.14 | 0 | 400 / 0 |
+| Candidate TTL | 0.66 / 1.31 / 1.65 | 100 | 0 / 0 |
+| Candidate validated | 3.71 / 30.04 / 33.44 | 0 | 40 / 600 |
+
+Validated reuse avoided 90% of business calls while increasing total MCP calls from 400
+to 640. The low TTL timings return stale data and are not equivalent optimizations.
+Raw trials, CPU and sampled RSS are in `target/remote-state/benchmark.json`.
+
+The same candidate passed all 4,000 state-workflow responses with 1,000 connected clients,
+500 pending calls and a 64-call upstream limit. Warm runs issued zero business calls;
+each single-branch change recomputed two nodes. Warm request p50/p95/p99 was
+109.33/114.37/115.46 ms in the paced burst workload. Post-phase gateway RSS samples reached
+139.92 MiB. Raw phases are in `target/remote-state/state-scale.json`.
+The ordinary 1,000-client/500-concurrency qualification also passed with 10 seconds of
+500-call/second offered load and 10% tracing; its sampled peak RSS was 327.61 MiB.
+That short run does not replace the longer measurements above. Its report is
+`target/remote-state/scale-qualification.json`.

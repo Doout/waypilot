@@ -31,6 +31,18 @@ jobs:
           cargo run --locked --release -- demo --samples 10 > target/benchmark.json
           python3 demos/mcp_demo.py target/release/waypilot > target/mcp-demo.json
           python3 scripts/benchmark_gateway.py target/release/waypilot --samples 100 > target/gateway-benchmark.json
+      - name: State validation benchmark controls
+        run: |
+          export WAYPILOT_PYTHON="$(command -v python3)"
+          python3 scripts/benchmark_state.py target/release/waypilot \
+            --baseline target/release/waypilot --samples 20 \
+            > target/state-benchmark.json
+      - name: Qualify state invalidation at 1,000 clients
+        if: runner.os == 'Linux'
+        run: |
+          export WAYPILOT_PYTHON="$(command -v python3)"
+          python3 load/state_qualify.py target/release/waypilot \
+            --clients 1000 --concurrency 500 --output target/state-scale.json
       - name: Qualify 1,000 clients and 500 concurrent calls
         if: runner.os == 'Linux'
         run: |
@@ -47,3 +59,6 @@ jobs:
             target/gateway-benchmark.json
             target/scale-smoke.json
             target/scale-qualification.json
+            target/state-scale-smoke.json
+            target/state-scale.json
+            target/state-benchmark.json

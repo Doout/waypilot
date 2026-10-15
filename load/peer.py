@@ -1,6 +1,7 @@
 """Asynchronous owned MCP peer. Failure injection is restricted to loopback tests."""
 
 import asyncio
+import hashlib
 import json
 import signal
 import time
@@ -10,6 +11,8 @@ from collections import Counter, deque
 
 async def main():
     sessions, gates = {}, {}
+    state_epoch = uuid.uuid4().hex
+    states = {key: {"value": key, "revision": 0, "read_ms": 0} for key in ["a", "b"]}
     initialize_gate = asyncio.Event()
     initialize_gate.set()
     calls, active, effects = Counter(), Counter(), Counter()
@@ -31,6 +34,11 @@ async def main():
             },
         }
         for name in ["echo", "hold", "cache_hold", "effect", "session"]
+    ]
+
+    tools += [
+        {"name": name, "inputSchema": {"type": "object"}}
+        for name in ["state_read", "state_version", "dependency_index", "source_index"]
     ]
 
     async def dispatch(path, request, headers, method):
@@ -70,6 +78,14 @@ async def main():
         if path == "/audit":
             return 200, {}, list(audit)
         if path == "/control":
+            if "state" in request:
+                update = request["state"]
+                row = states[update.get("key", "a")]
+                if update.get("touch") or "value" in update:
+                    row["revision"] += 1
+                for key in ["value", "read_ms"]:
+                    if key in update:
+                        row[key] = update[key]
             if "pause_initialize" in request:
                 initialize_gate.clear() if request["pause_initialize"] else initialize_gate.set()
             if "release" in request:
@@ -125,13 +141,46 @@ async def main():
         active[phase] += 1
         audit.append(
             {
-                "nonce": args["nonce"],
-                "owner": args["owner"],
+                "nonce": args.get("nonce", "state"),
+                "owner": args.get("owner", "state"),
                 "tool": tool,
                 "at": time.monotonic(),
             }
         )
         try:
+            if tool in ["state_read", "state_version", "dependency_index", "source_index"]:
+                meta = {}
+                if tool in ["state_read", "state_version"]:
+                    query = args.get("arguments", {}) if tool == "state_version" else args
+                    key = query.get("key", "a")
+                    row = states[key]
+                    result = {"value": row["value"]} if tool == "state_read" else {}
+                    meta = {
+                        "io.waypilot/state": {
+                            "version": 1,
+                            "resources": {key: f"{state_epoch}:{row['revision']}"},
+                        }
+                    }
+                    await asyncio.sleep(row["read_ms"] / 1000 if tool == "state_read" else 0)
+                else:
+                    result = {
+                        "fingerprint": hashlib.sha256(
+                            json.dumps(args["value"], sort_keys=True).encode()
+                        ).hexdigest()
+                    }
+                return (
+                    200,
+                    {},
+                    dict(
+                        reply,
+                        result={
+                            "content": [{"type": "text", "text": json.dumps(result)}],
+                            "structuredContent": result,
+                            "isError": False,
+                            "_meta": meta,
+                        },
+                    ),
+                )
             if tool == "effect":
                 effects[args["nonce"]] += 1
                 if args.get("drop"):

@@ -36,7 +36,7 @@ def main():
     checks = []
     # Readiness must not depend on the host's DNS configuration. The ordinary
     # HTTPServer bind path would call this forbidden resolver before listening.
-    no_dns = "import runpy,socket,sys\ndef forbidden(*args, **kwargs):\n raise RuntimeError('fixture tried reverse DNS')\nsocket.getfqdn=forbidden\npath=sys.argv[1]\nsys.argv=[path]\nrunpy.run_path(path,run_name='__main__')"
+    no_dns = "import runpy,socket,sys\ndef forbidden(*args, **kwargs):\n raise RuntimeError('fixture tried reverse DNS')\nsocket.getfqdn=forbidden\npath=sys.argv[1]\nsys.path.insert(0,str(__import__('pathlib').Path(path).parent))\nsys.argv=[path]\nrunpy.run_path(path,run_name='__main__')"
     with Process([python, "-c", no_dns, str(ROOT / "fixtures/http_server.py")], dict(os.environ)) as fixture:
         client = Client("http://" + fixture.ready["listen"], "owned-fixture")
         assert client.call("echo", {"value": "no-dns"})["structuredContent"] == {"value": "no-dns"}
