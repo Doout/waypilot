@@ -1,0 +1,28 @@
+[package]
+name = "waypilot"
+version = "0.1.0-alpha.1"
+edition = "2021"
+license = "Apache-2.0"
+description = "An experimental adaptive tool execution runtime built on Wayframe"
+repository = "https://github.com/Doout/waypilot"
+publish = false
+
+[dependencies]
+anyhow = "1"
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tracing = "0.1"
+wayframe-core = { git = "https://github.com/Doout/wayframe", rev = "ec4d27224ec213eabc2eae9b474b522d1cab8874" }
+wayframe-flow = { git = "https://github.com/Doout/wayframe", rev = "ec4d27224ec213eabc2eae9b474b522d1cab8874" }
+wayframe-transport = { git = "https://github.com/Doout/wayframe", rev = "ec4d27224ec213eabc2eae9b474b522d1cab8874" }
+wayframe-observability = { git = "https://github.com/Doout/wayframe", rev = "ec4d27224ec213eabc2eae9b474b522d1cab8874", features = ["otel"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

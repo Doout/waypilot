@@ -1,0 +1,1 @@
+Waypilot owns agent and MCP semantics. Wayframe owns reusable, transport-neutral execution primitives. Keep mandatory controls outside reusable computation results. Treat traces as optimization evidence, not authorization or proof of independence. Preserve the exact-input baseline and report extra work alongside latency.
