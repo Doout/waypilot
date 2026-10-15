@@ -2,6 +2,7 @@
 import http.server
 import json
 import os
+import socketserver
 from pathlib import Path
 import subprocess
 import sys
@@ -26,7 +27,13 @@ def main():
             pass
 
     binary = Path(sys.argv[1]).resolve()
-    collector = http.server.HTTPServer(("127.0.0.1", 0), Collector)
+    class LoopbackServer(http.server.HTTPServer):
+        def server_bind(self):
+            socketserver.TCPServer.server_bind(self)
+            self.server_name = "localhost"
+            self.server_port = self.server_address[1]
+
+    collector = LoopbackServer(("127.0.0.1", 0), Collector)
     thread = threading.Thread(target=collector.serve_forever, daemon=True)
     thread.start()
     environment = dict(os.environ)

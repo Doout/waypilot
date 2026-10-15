@@ -7,7 +7,7 @@ Recorded 2026-10-14 on macOS arm64, Apple M2 Max, Rust 1.99.0, Python 3.14.7. Ru
 `bash scripts/verify.sh` passed:
 
 - Formatting, 7 unit tests, 10 live fixture integration tests, Clippy with warnings denied and Python syntax checks.
-- 43 live gateway checks covering real stdio branches and JSON/SSE upstreams, exact/partial reuse, learned preparation without invocation, grants, identity/session isolation, rate limits, singleflight, invalidation, malformed/oversized requests, cancellation, deadlines, admin CLI and revocation while an effect waits for a connection.
+- 44 live gateway checks covering DNS-independent fixture startup, real stdio branches and JSON/SSE upstreams, exact/partial reuse, learned preparation without invocation, grants, identity/session isolation, rate limits, singleflight, invalidation, malformed/oversized requests, cancellation, deadlines, admin CLI and revocation while an effect waits for a connection.
 - The independent official Python SDK `mcp==2.0.1`, using its default negotiation against HTTP and stdio ingress, including a workflow and retained result reuse.
 - Actual OTLP/HTTP JSON export to an ephemeral collector: 312 spans, including 101 graph nodes with dependency/scheduler/execution timing fields, gateway-to-upstream trace parentage, valid timestamps and executed/reused dispositions.
 

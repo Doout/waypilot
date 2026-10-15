@@ -70,8 +70,10 @@ class Process:
         self.log = tempfile.TemporaryFile(mode="w+")
         self.process = subprocess.Popen(command, env=environment, stdout=subprocess.PIPE, stderr=self.log, text=True)
         if not select.select([self.process.stdout], [], [], 20)[0]:
+            self.log.seek(0)
+            message = self.log.read()[-4000:]
             self.close()
-            raise RuntimeError("service did not announce readiness")
+            raise RuntimeError(f"service did not announce readiness: {message}")
         line = self.process.stdout.readline()
         if not line:
             self.log.seek(0)

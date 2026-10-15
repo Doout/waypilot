@@ -10,7 +10,7 @@ import urllib.error
 import urllib.request
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "demos"))
-from mcp_demo import Client, Demo, http, run
+from mcp_demo import Client, Demo, Process, ROOT, http, run
 
 
 def raw(demo, data, headers=None):
@@ -34,6 +34,14 @@ def main():
     binary = sys.argv[1]
     python = os.environ["WAYPILOT_PYTHON"]
     checks = []
+    # Readiness must not depend on the host's DNS configuration. The ordinary
+    # HTTPServer bind path would call this forbidden resolver before listening.
+    no_dns = "import runpy,socket,sys\ndef forbidden(*args, **kwargs):\n raise RuntimeError('fixture tried reverse DNS')\nsocket.getfqdn=forbidden\npath=sys.argv[1]\nsys.argv=[path]\nrunpy.run_path(path,run_name='__main__')"
+    with Process([python, "-c", no_dns, str(ROOT / "fixtures/http_server.py")], dict(os.environ)) as fixture:
+        client = Client("http://" + fixture.ready["listen"], "owned-fixture")
+        assert client.call("echo", {"value": "no-dns"})["structuredContent"] == {"value": "no-dns"}
+        client.close()
+    checks.append("loopback_startup_without_dns")
     result = run(binary, python)
     assert [case["upstream_calls"] for case in result["workflow"]] == [4, 0, 2]
     checks.extend(["stdio_branches", "parallel_join", "full_reuse", "partial_recompute", "prewarm_without_calls", "mutable_tool_not_reused"])

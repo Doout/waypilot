@@ -4,10 +4,12 @@ The counter intentionally claims readOnlyHint=true: the gateway must trust its
 operator contract instead of inferring reusable behavior from this annotation.
 """
 import argparse
+import faulthandler
 import hashlib
 import http.server
 import json
 import socket
+import socketserver
 import threading
 import time
 import uuid
@@ -26,6 +28,7 @@ TOOLS = [
 
 
 def main():
+    faulthandler.dump_traceback_later(10)
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=0)
     parser.add_argument("--response", choices=["json", "sse"], default="json")
@@ -139,8 +142,17 @@ def main():
         def log_message(self, *_args):
             pass
 
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+    class LoopbackServer(http.server.ThreadingHTTPServer):
+        def server_bind(self):
+            # HTTPServer normally reverse-resolves the bound address. An owned
+            # loopback fixture needs no DNS and must start independently of it.
+            socketserver.TCPServer.server_bind(self)
+            self.server_name = "localhost"
+            self.server_port = self.server_address[1]
+
+    server = LoopbackServer(("127.0.0.1", args.port), Handler)
     print(json.dumps({"listen": f"127.0.0.1:{server.server_port}"}), flush=True)
+    faulthandler.cancel_dump_traceback_later()
     server.serve_forever()
 
 
