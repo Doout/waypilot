@@ -11,22 +11,35 @@ use std::{
 /// Local stdio uses the operator-selected principal and the same controls and
 /// compiled graphs as HTTP. stdout contains only MCP JSON-RPC messages.
 pub async fn serve_stdio(gateway: Arc<Gateway>, user: &str) -> Result<()> {
-    use futures_util::StreamExt;
-    use tokio::io::AsyncWriteExt;
-    use tokio_util::codec::{FramedRead, LinesCodec};
     let actor = gateway
         .actors
         .iter()
         .find(|actor| actor.settings.id == user && actor.enabled.load(Ordering::Acquire))
         .context("unknown or disabled stdio principal")?
         .clone();
+    let cleanup = tokio_util::task::AbortOnDropHandle::new(gateway.cleanup.start());
+    let maintenance =
+        tokio_util::task::AbortOnDropHandle::new(tokio::spawn(gateway.clone().maintain()));
+    let result = run_stdio(gateway.clone(), actor).await;
+    maintenance.abort();
+    let _ = maintenance.await;
+    gateway.shutdown().await;
+    cleanup.abort();
+    let _ = cleanup.await;
+    result
+}
+
+async fn run_stdio(gateway: Arc<Gateway>, actor: Arc<super::Actor>) -> Result<()> {
+    use futures_util::StreamExt;
+    use tokio::io::AsyncWriteExt;
+    use tokio_util::codec::{FramedRead, LinesCodec};
     let mut session: Option<Arc<Session>> = None;
     let mut input = FramedRead::new(
         tokio::io::stdin(),
         LinesCodec::new_with_max_length(MAX_MESSAGE),
     );
     let (sender, mut receiver) = tokio::sync::mpsc::channel::<Value>(32);
-    let writer = tokio::spawn(async move {
+    let writer = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
         let mut output = tokio::io::stdout();
         while let Some(value) = receiver.recv().await {
             let mut bytes = serde_json::to_vec(&value)?;
@@ -42,7 +55,7 @@ pub async fn serve_stdio(gateway: Arc<Gateway>, user: &str) -> Result<()> {
             output.flush().await?;
         }
         Ok::<_, anyhow::Error>(())
-    });
+    }));
     let mut jobs = tokio::task::JoinSet::new();
     while let Some(line) = input.next().await {
         let line = line?;
@@ -113,6 +126,5 @@ pub async fn serve_stdio(gateway: Arc<Gateway>, user: &str) -> Result<()> {
     while jobs.join_next().await.is_some() {}
     drop(sender);
     writer.await??;
-    gateway.shutdown().await;
     Ok(())
 }

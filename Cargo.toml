@@ -1,9 +1,9 @@
 [package]
 name = "waypilot"
-version = "0.1.0-alpha.1"
+version = "0.2.0-alpha.1"
 edition = "2021"
 license = "Apache-2.0"
-description = "An experimental adaptive tool execution runtime built on Wayframe"
+description = "A controlled MCP execution service built on Wayframe"
 repository = "https://github.com/Doout/waypilot"
 publish = false
 

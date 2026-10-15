@@ -24,6 +24,10 @@ async fn main() -> Result<()> {
     let _telemetry = wayframe_observability::init()?;
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
+        Some("--version") => {
+            println!("waypilot {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
         Some("demo") => fixture_demo(args).await,
         Some("serve") | Some("serve-stdio") => {
             let stdio = std::env::args().nth(1).as_deref() == Some("serve-stdio");
@@ -60,13 +64,7 @@ async fn main() -> Result<()> {
                 "{}",
                 json!({"listen":listener.local_addr()?.to_string(),"transport":"streamable_http"})
             );
-            let shutdown = gateway.clone();
-            axum::serve(listener, gateway.router())
-                .with_graceful_shutdown(async move {
-                    shutdown_signal().await;
-                    shutdown.shutdown().await;
-                })
-                .await?;
+            gateway.serve_http(listener, shutdown_signal()).await?;
             Ok(())
         }
         Some(command @ ("list" | "call")) => {

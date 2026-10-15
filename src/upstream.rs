@@ -115,21 +115,59 @@ enum Wire {
     },
 }
 
+pub(crate) struct Connector {
+    endpoint: Endpoint,
+    http: Option<reqwest::Client>,
+    cleanup: Option<Arc<crate::upstream_cleanup::Cleanup>>,
+    preparing: Arc<tokio::sync::Semaphore>,
+}
+impl Connector {
+    pub fn new(
+        endpoint: Endpoint,
+        cleanup: Option<Arc<crate::upstream_cleanup::Cleanup>>,
+        idle_connections: usize,
+        preparing: Arc<tokio::sync::Semaphore>,
+    ) -> Result<Arc<Self>> {
+        endpoint.validate()?;
+        let http = if matches!(endpoint, Endpoint::Http { .. }) {
+            Some(
+                reqwest::Client::builder()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .retry(reqwest::retry::never())
+                    .no_proxy()
+                    .connect_timeout(Duration::from_secs(5))
+                    .pool_max_idle_per_host(idle_connections)
+                    .pool_idle_timeout(Duration::from_secs(30))
+                    .build()?,
+            )
+        } else {
+            None
+        };
+        Ok(Arc::new(Self {
+            endpoint,
+            http,
+            cleanup,
+            preparing,
+        }))
+    }
+}
 struct Connection {
     wire: Wire,
     version: String,
     tools: Vec<Value>,
     catalog_revision: String,
+    active_request: Option<u64>,
+    cleanup: Option<Arc<crate::upstream_cleanup::Cleanup>>,
 }
 
 /// Each downstream session owns a separate client. Holding this lock during a
 /// call prevents stdio cancellation from killing another in-flight invocation.
 pub struct Client {
-    endpoint: Endpoint,
+    connector: Arc<Connector>,
     connection: Mutex<Option<Connection>>,
-    sequence: AtomicU64,
+    sequence: Arc<AtomicU64>,
     pub calls: AtomicU64,
-    pub connects: AtomicU64,
+    pub connects: Arc<AtomicU64>,
     meter: Option<Arc<AtomicU64>>,
 }
 
@@ -141,26 +179,43 @@ pub struct Catalog {
 
 impl Client {
     pub fn new(endpoint: Endpoint) -> Result<Self> {
-        endpoint.validate()?;
+        Self::with_connector(
+            Connector::new(
+                endpoint,
+                None,
+                16,
+                Arc::new(tokio::sync::Semaphore::new(16)),
+            )?,
+            None,
+        )
+    }
+
+    pub(crate) fn with_connector(
+        connector: Arc<Connector>,
+        meter: Option<Arc<AtomicU64>>,
+    ) -> Result<Self> {
         Ok(Self {
-            endpoint,
+            connector,
             connection: Mutex::new(None),
-            sequence: AtomicU64::new(1),
+            sequence: Arc::new(AtomicU64::new(1)),
             calls: AtomicU64::new(0),
-            connects: AtomicU64::new(0),
-            meter: None,
+            connects: Arc::new(AtomicU64::new(0)),
+            meter,
         })
     }
 
-    pub fn metered(endpoint: Endpoint, meter: Arc<AtomicU64>) -> Result<Self> {
-        let mut client = Self::new(endpoint)?;
-        client.meter = Some(meter);
-        Ok(client)
-    }
-
-    async fn connect(&self, deadline: Instant) -> Result<Connection> {
+    async fn connect_owned<F>(
+        connector: Arc<Connector>,
+        sequence: Arc<AtomicU64>,
+        connects: Arc<AtomicU64>,
+        deadline: Instant,
+        abandoned: F,
+    ) -> Result<Connection>
+    where
+        F: Fn() -> bool + Send + Sync,
+    {
         ensure!(Instant::now() < deadline, "upstream deadline exceeded");
-        let wire = match &self.endpoint {
+        let wire = match &connector.endpoint {
             Endpoint::Stdio {
                 command,
                 args,
@@ -190,11 +245,7 @@ impl Client {
                     header.set_sensitive(true);
                     headers.insert(reqwest::header::AUTHORIZATION, header);
                 }
-                let client = reqwest::Client::builder()
-                    .redirect(reqwest::redirect::Policy::none())
-                    .no_proxy()
-                    .connect_timeout(Duration::from_secs(5))
-                    .build()?;
+                let client = connector.http.as_ref().expect("HTTP connector").clone();
                 Wire::Http {
                     client,
                     url: url.parse()?,
@@ -203,14 +254,16 @@ impl Client {
                 }
             }
         };
-        self.connects.fetch_add(1, Ordering::Relaxed);
+        connects.fetch_add(1, Ordering::Relaxed);
         let mut connection = Connection {
             wire,
             version: VERSIONS[0].into(),
             tools: Vec::new(),
             catalog_revision: String::new(),
+            active_request: None,
+            cleanup: connector.cleanup.clone(),
         };
-        let id = self.next_id()?;
+        let id = next_id(&sequence)?;
         let reply = exchange(&mut connection, json!({"jsonrpc":"2.0","id":id,"method":"initialize","params":{"protocolVersion":VERSIONS[0],"capabilities":{},"clientInfo":{"name":"waypilot","version":env!("CARGO_PKG_VERSION")}}}), deadline).await?;
         let initialized = result(reply, id)?;
         let version = initialized["protocolVersion"]
@@ -225,6 +278,7 @@ impl Client {
             "upstream does not advertise tools"
         );
         connection.version = version.into();
+        ensure!(!abandoned(), "preparation abandoned after initialization");
         exchange(
             &mut connection,
             json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
@@ -236,7 +290,11 @@ impl Client {
         let mut names = HashSet::new();
         let mut catalog_bytes = 2usize;
         for _ in 0..16 {
-            let id = self.next_id()?;
+            ensure!(
+                !abandoned(),
+                "preparation abandoned during catalog discovery"
+            );
+            let id = next_id(&sequence)?;
             let params = cursor
                 .as_ref()
                 .map(|v| json!({"cursor":v}))
@@ -290,11 +348,7 @@ impl Client {
     }
 
     fn next_id(&self) -> Result<u64> {
-        self.sequence
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-                value.checked_add(1)
-            })
-            .map_err(|_| anyhow::anyhow!("MCP request IDs exhausted"))
+        next_id(&self.sequence)
     }
 
     pub async fn catalog(&self, deadline: Instant) -> Result<Catalog> {
@@ -312,7 +366,8 @@ impl Client {
                 "upstream deadline exceeded before preparation"
             );
             check()?;
-            self.prepare(&mut guard, deadline).await?;
+            self.prepare(&mut guard, deadline, &check).await?;
+            check()?;
             let connection = guard.as_ref().expect("prepared connection");
             Ok(Catalog {
                 tools: connection.tools.clone(),
@@ -323,14 +378,44 @@ impl Client {
         .await?
     }
 
-    async fn prepare(&self, guard: &mut Option<Connection>, deadline: Instant) -> Result<()> {
+    async fn prepare<F>(
+        &self,
+        guard: &mut Option<Connection>,
+        deadline: Instant,
+        check: &F,
+    ) -> Result<()>
+    where
+        F: Fn() -> Result<()> + Send + Sync,
+    {
         if guard.as_ref().is_some_and(
             |connection| matches!(&connection.wire, Wire::Stdio(process) if !process.ready()),
         ) {
             *guard = None;
         }
         if guard.is_none() {
-            *guard = Some(self.connect(deadline).await?);
+            let preparation =
+                timeout_at(deadline, self.connector.preparing.clone().acquire_owned()).await??;
+            ensure!(
+                Instant::now() < deadline,
+                "preparation queue deadline exceeded"
+            );
+            check()?;
+            let connector = self.connector.clone();
+            let sequence = self.sequence.clone();
+            let connects = self.connects.clone();
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            // Complete an admitted handshake under its original deadline even if
+            // its caller disappears. A discarded result owns the new session ID
+            // and queues deletion. No tools/call is ever issued by this task.
+            tokio::spawn(async move {
+                let _preparation = preparation;
+                let result = Self::connect_owned(connector, sequence, connects, deadline, || {
+                    sender.is_closed()
+                })
+                .await;
+                let _ = sender.send(result);
+            });
+            *guard = Some(receiver.await??);
         }
         Ok(())
     }
@@ -354,7 +439,7 @@ impl Client {
             let mut guard = self.connection.lock().await;
             ensure!(Instant::now() < deadline, "upstream deadline exceeded before admission");
             check()?;
-            self.prepare(&mut guard, deadline).await?;
+            self.prepare(&mut guard, deadline, &check).await?;
             check()?;
             ensure!(Instant::now() < deadline, "upstream deadline exceeded before dispatch");
             // Ownership stays with this invocation while I/O is pending. On
@@ -364,10 +449,12 @@ impl Client {
             let id = self.next_id()?;
             self.calls.fetch_add(1, Ordering::Relaxed);
             if let Some(meter) = &self.meter { meter.fetch_add(1, Ordering::Relaxed); }
+            connection.active_request = Some(id);
             let response = exchange(&mut connection, json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":name,"arguments":arguments}}), deadline).await;
             // A transport/protocol failure invalidates the session. Never replay this
             // invocation: it may already have caused an external effect.
             let reply = response?;
+            connection.active_request = None;
             let value = result(reply, id)?;
             ensure!(value.is_object() && value["content"].is_array(), "invalid MCP tool result");
             ensure!(value.get("isError").is_none_or(Value::is_boolean) && value.get("_meta").is_none_or(Value::is_object), "invalid MCP tool result metadata");
@@ -377,29 +464,65 @@ impl Client {
     }
 
     pub async fn close(&self) {
-        let mut guard = self.connection.lock().await;
-        if let Some(Connection {
-            wire:
-                Wire::Http {
-                    client,
-                    url,
-                    headers,
-                    session: Some(session),
-                },
-            version,
-            ..
-        }) = guard.take()
-        {
-            let _ = client
-                .delete(url)
-                .headers(*headers)
-                .header("MCP-Session-Id", session)
-                .header("MCP-Protocol-Version", version)
-                .timeout(Duration::from_secs(2))
-                .send()
-                .await;
+        let connection = self.connection.lock().await.take();
+        if let Some(mut connection) = connection {
+            if connection.cleanup.is_some() {
+                drop(connection);
+                return;
+            }
+            if let Wire::Http {
+                client,
+                url,
+                headers,
+                session,
+            } = &mut connection.wire
+            {
+                if let Some(session) = session.take() {
+                    let _ = client
+                        .delete(url.clone())
+                        .headers(headers.as_ref().clone())
+                        .header("MCP-Session-Id", session)
+                        .header("MCP-Protocol-Version", &connection.version)
+                        .timeout(Duration::from_secs(2))
+                        .send()
+                        .await;
+                }
+            }
         }
     }
+}
+impl Drop for Connection {
+    fn drop(&mut self) {
+        if let (
+            Some(cleanup),
+            Wire::Http {
+                client,
+                url,
+                headers,
+                session,
+            },
+        ) = (&self.cleanup, &mut self.wire)
+        {
+            if session.is_some() || self.active_request.is_some() {
+                cleanup.enqueue(crate::upstream_cleanup::Action {
+                    client: client.clone(),
+                    url: url.clone(),
+                    headers: headers.as_ref().clone(),
+                    session: session.take(),
+                    version: self.version.clone(),
+                    request_id: self.active_request.take(),
+                });
+            }
+        }
+    }
+}
+
+fn next_id(sequence: &AtomicU64) -> Result<u64> {
+    sequence
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            value.checked_add(1)
+        })
+        .map_err(|_| anyhow::anyhow!("MCP request IDs exhausted"))
 }
 
 fn result(reply: Option<Value>, id: u64) -> Result<Value> {
@@ -568,6 +691,42 @@ fn parse_sse(buffer: &mut Vec<u8>, expected: &Value) -> Result<Option<Value>> {
             );
             return Ok(Some(reply));
         }
+    }
+}
+
+/// Stable error category without URLs, headers, credentials or response payloads.
+pub(crate) fn failure_kind(error: &anyhow::Error) -> &'static str {
+    for cause in error.chain() {
+        if let Some(error) = cause.downcast_ref::<std::io::Error>() {
+            match error.kind() {
+                std::io::ErrorKind::ConnectionReset => return "connection_reset",
+                std::io::ErrorKind::ConnectionAborted => return "connection_aborted",
+                std::io::ErrorKind::UnexpectedEof => return "unexpected_eof",
+                _ => {}
+            }
+        }
+    }
+    if let Some(error) = error.downcast_ref::<reqwest::Error>() {
+        if error.is_timeout() {
+            "http_timeout"
+        } else if error.is_connect() {
+            "http_connect"
+        } else if error.is_body() {
+            "http_body"
+        } else if error.is_request() {
+            "http_request"
+        } else {
+            "http_protocol"
+        }
+    } else if error
+        .downcast_ref::<tokio::time::error::Elapsed>()
+        .is_some()
+    {
+        "deadline"
+    } else if error.downcast_ref::<std::io::Error>().is_some() {
+        "io"
+    } else {
+        "mcp_protocol"
     }
 }
 

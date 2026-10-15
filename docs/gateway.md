@@ -1,81 +1,108 @@
-# Operating the MCP prototype
+# Gateway reference
 
-## Request path
+## Configuration and clients
 
-HTTP clients send MCP JSON-RPC to `/mcp` with a user bearer token. Initialize first, retain the returned `MCP-Session-Id`, send `notifications/initialized`, and include that ID and the negotiated `MCP-Protocol-Version` on subsequent messages. The bundled `list` and `call` commands handle this lifecycle and close their session afterward. The official Python MCP SDK is an independent interoperability check in `scripts/check_sdk.py`.
+Load TOML with `waypilot serve --config FILE`. Start with [service.toml](../examples/service.toml). Restart to change users, credentials, grants, limits or server contracts. Secrets come from named environment variables. Upstream credentials are separate from gateway user tokens.
 
-`tools/list` exposes permitted tools as `server__tool` and eligible authored workflows as `waypilot__name`. Discovery fails if a configured, accessible upstream cannot initialize; this prototype does not silently return a partial catalog. `tools/call` executes through a Wayframe graph, rechecks grants, and returns the upstream MCP ToolResult with runtime metadata under `_meta["io.waypilot/runtime"]`.
+HTTP upstreams require HTTPS, loopback HTTP or `allow_insecure_http = true`. Redirects, automatic retries and environment proxy discovery are disabled. Use TLS and connection/header limits at your hosting ingress. A connection's read-idle timeout does not enforce an absolute header deadline. Requests with `Origin` require an exact match in `allowed_origins`. Browser CORS preflight is unsupported.
 
-The HTTP endpoint responds with JSON. It accepts clients advertising both JSON and SSE, as required by the [classic Streamable HTTP transport contract](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports). HTTP GET returns 405; this implementation does not offer a server event stream. DELETE closes the downstream session and its upstream connections. `/healthz` is a process readiness check, not an upstream connectivity or authorization probe.
+Stdio endpoints take an absolute `command`, `args` and optional `inherit_env` names. `env:WAYPILOT_PYTHON` resolves a command from that variable. `{config_dir}` resolves paths relative to the configuration file. Child processes receive a cleared environment plus the explicit allowlist. Configuration can launch programs and choose network destinations, so only operators should edit it.
 
-Stdio ingress uses `serve-stdio --config FILE --user ID`. It binds the process to an operator-selected configured user, accepts bounded JSONL, and applies the same tool controls and graph execution. Notifications can cancel active requests while the input loop continues. The local process owner controls which principal is selected.
+HTTP clients POST to `/mcp` with a bearer token and `Accept: application/json, text/event-stream`. Initialize, retain `MCP-Session-Id`, send `notifications/initialized`, then include the session ID and negotiated `MCP-Protocol-Version` on subsequent messages. DELETE closes the session. The `list` and `call` CLI commands handle this exchange.
 
-## Transport support
+For stdio ingress, launch the absolute binary path with `serve-stdio --config FILE --user ID`. The operator selects the configured principal. Stdout contains JSON-RPC; logs go to stderr.
 
-| Behavior | Ingress | Upstream |
+Both sides support stdio and classic Streamable HTTP. Upstream POST responses may be JSON or SSE; ingress returns JSON. Supported versions are `2025-11-25`, `2025-06-18` and `2025-03-26`. Only tools are advertised. Legacy SSE, GET streams, resumption, server callbacks, OAuth, durable jobs and agent adapters are unsupported. Full tool input-schema validation belongs to the upstream. A fresh session rediscovers its catalog; catalog-change notifications do not update it.
+
+## Users and administration
+
+Configure users, tenants, tokens, tool grants and token buckets in TOML. Tokens must be distinct and contain 16 to 4096 visible ASCII bytes. Grants accept an exact tool name, `server__*` or `*`. A workflow requires its own grant and every child tool's grant.
+
+Tool calls consume a token, including reuse hits. Workflows also consume an entry token. Prewarm batches consume one token; metadata requests use request admission without consuming tool tokens.
+
+Admin endpoints require the separate admin token:
+
+| Request | Body | Result |
 | --- | --- | --- |
-| Stdio JSON-RPC | Yes | Yes, supervised subprocess |
-| Streamable HTTP POST, JSON | Yes | Yes |
-| Streamable HTTP POST, SSE response | Returns JSON | Yes, including fragmented events and notifications |
-| Classic protocol negotiation | 2025-11-25, 2025-06-18, 2025-03-26 | Same supported set |
-| Static bearer credential | Per configured user | Separate optional environment credential |
-| Per-request cancellation | Local work and response delivery | Drops local exchange/session; no remote rollback guarantee |
-| Legacy HTTP+SSE with separate message endpoint | No | No |
-| GET stream, resumption, server push | No | No |
-| Sampling, elicitation, roots, resources, prompts | No advertised capability | No forwarded client callbacks |
-| OAuth discovery/token exchange | No | No |
+| `GET /admin/stats` | None | Admission, connections, accounted bytes, cache and cleanup counters |
+| `GET /admin/users` | None | Users, grants and rate settings, without tokens |
+| `POST /admin/users/update` | `{"id":"developer","enabled":false}` | Enable or disable a user |
+| `POST /admin/invalidate` | Empty | Clear retained results and advance the generation |
 
-Only the tool capability is advertised. An upstream callback request fails the exchange; unsolicited notification events are skipped. Dynamic catalog notifications are not applied to an existing cached catalog. Restart the gateway after changing operator contracts/configuration; create a fresh downstream session to rediscover an upstream catalog. A catalog digest participates in reuse keys but does not prove that external resource data is fresh.
+```sh
+target/debug/waypilot admin --url http://127.0.0.1:7400 \
+  --token-env WAYPILOT_ADMIN_TOKEN --action disable --user developer
+```
 
-## Identities, grants and administration
+Other actions are `stats`, `users`, `enable` and `invalidate`. Disabling cancels the user's sessions and prevents queued dispatch. Re-enabling requires a new session. Admin changes advance a global generation, clear retained results and reject older-generation results. This can interrupt other users' active work.
 
-The TOML configuration is the durable source of users, tenants, credential environment names, tool grants and rate limits. Tokens must be distinct, 16–4096 visible ASCII bytes; use randomly generated tokens. Only hashes of user/admin tokens are retained in the authorization table. Upstream credentials remain in the upstream client and are never copied from a downstream bearer token.
+Set `state_path = "../var/policy.json"` to persist enabled-state overrides relative to the configuration file. One process owns the file through an OS lock. Writes use mode 0600 on Unix, atomic replacement and file/directory sync. Startup fails if the file is unwritable or names an unconfigured user. Admin disconnects do not cancel an admitted write. A write error leaves the running override unchanged; an I/O error after rename can leave an uncertain disk outcome.
 
-Sessions are random identifiers bound to the current authenticated user. They cannot be used with another user's token. Each downstream session owns its own upstream connections; credentials and mutable session state are not pooled across users. Reusable results may cross sessions only for the same user and explicit contract. Such a contract must declare that output is independent of unkeyed session state.
+Keep the state on a local filesystem and preserve it across restarts. Without `state_path`, overrides stay in memory. Sessions, cached results and usage profiles always stay in memory. Replicas do not share policy updates or sessions.
 
-Administrative endpoints require the separate administrator credential:
+## Workflows, reuse and prewarming
 
-| Method and path | Request | Result |
-| --- | --- | --- |
-| `GET /admin/stats` | None | Aggregate requests, upstream calls, reuse counts, prewarm counts, sessions and cache bounds |
-| `GET /admin/users` | None | IDs, tenants, enabled state, grants and rate settings; no tokens |
-| `POST /admin/users/update` | `{"id":"developer","enabled":false}` | In-memory enabled override and new generation |
-| `POST /admin/invalidate` | Empty body | New generation and removal of previous retained results |
+Waypilot owns MCP semantics and user controls. Wayframe supplies graph execution, caching, process supervision and telemetry through the revision pinned in [Cargo.toml](../Cargo.toml).
 
-The `admin` CLI exposes these operations through `--action stats|users|disable|enable|invalidate`, with `--user` for enable/disable. Runtime overrides are not written to disk. To add/remove users, rotate tokens, edit grants or change limits durably, update the configuration/environment and restart. Session results, reuse state and server-use profiles are also process-local.
+Tools use `server__tool` names; workflows use `waypilot__name`. [local.toml](../examples/local.toml) shows input bindings and dependencies on earlier steps. Independent steps run concurrently, up to four nodes per workflow. All configured steps execute, including those omitted from selected outputs. Access checks run before lookup, before dispatch and before release.
 
-Disabling a user cancels their sessions. Both disabling and enabling increment the **global** generation, invalidating all retained data and rejecting results from an earlier generation. This conservative implementation can interrupt other users' active work during an administrative update. Re-enabling requires a fresh session; it does not revive canceled sessions.
+Each downstream session has separate upstream session IDs and catalogs. Calls within one upstream session serialize; separate sessions and servers can run in parallel. HTTP transport pools share TCP connections without sharing logical MCP state.
 
-## Bounds and deadlines
+Reuse is off by default. Enable it only when the tool has no required effect and its result stays valid for the declared TTL, independently of session state:
 
-Defaults are 128 downstream sessions, a 15-minute idle session lifetime, and 32 admitted active MCP requests. Each session allows at most 32 pending request IDs. Admission rejects overload rather than maintaining an unbounded request queue. Each upstream session serializes its own preparation and invocation; different servers/sessions can execute in parallel. Authored workflows admit at most four simultaneously running nodes.
+```toml
+[servers.tools.echo]
+reusable = true
+cache_ttl_ms = 60000
+```
 
-Bodies, upstream responses, combined upstream catalogs and retained workflow tool results have 1 MiB limits. A final encoded workflow response can exceed the response cap because it contains both text and structured content; it then fails instead of releasing a partial response. Catalog discovery allows at most 16 pages and 512 tools per upstream. The result store has 512 entries, a 16 MiB accounted payload budget, TTL expiry and 128 tracked singleflight keys. Payload accounting excludes allocator/object overhead.
+Keys include tenant, user, grants, generation, server revision, catalog digest, tool and exact arguments. Errors are not retained. `readOnlyHint` does not enable reuse. TTL expiry limits staleness but cannot detect external changes. Bump the server revision and restart when its contract changes.
 
-`request_timeout_ms` bounds HTTP body read and execution together. Body reads are additionally capped at five seconds. The original execution deadline passes through Wayframe and the upstream client. Stdio requests start their execution deadline after a complete input line. Notifications such as cancellation do not consume an MCP request admission slot, so they can stop work at capacity.
+Matching misses share a singleflight guard. A follower may use the leader's retained result after current access checks. If the leader fails, a follower may make its own eligible call. The gateway retains individual tool results. Unchanged workflow branches avoid calls through those results; it does not retain arbitrary whole graphs.
 
-Tool calls consume a per-user token-bucket token, including reuse hits and requests joining a retained result. A virtual workflow consumes one entry token plus each invoked child token. Prewarm batches consume one token, prepare at most two servers and share a separate two-batch admission pool. Metadata operations still use request admission; they do not consume tool tokens. These are prototype application limits, not a complete network abuse or identity-management service.
+Set `prewarm = true` to allow initialization and catalog discovery without tool invocation. On new HTTP sessions, the predictor can prepare up to two permitted servers based on that user's past server use. Manual preparation uses `POST /v1/prewarm` with `{"servers":["deps","source"]}` and the MCP user/session/protocol headers. Two prewarm batches may run at once, with at most two servers each.
 
-## Preparation, reuse and effects
+## Limits and shutdown
 
-Only servers with `prewarm = true` and current user grants can be prepared. The manual endpoint is `POST /v1/prewarm` with `{"servers":["deps","source"]}` and the same user/session/protocol headers as MCP calls. Success reports `prepared` and `tool_calls: 0`. Preparation performs initialization and `tools/list`; a server may still observe these requests or perform its own startup actions.
+Top-level defaults are `max_sessions = 128`, `max_in_flight = 32`, `session_ttl_seconds = 900` and `request_timeout_ms = 30000`. Each session permits 32 pending request IDs. Each server's `max_in_flight` defaults to 512.
 
-After at least two successful tool-use observations, a per-user frequency baseline can select up to two opted-in servers seen in at least half of that user's observations. HTTP initialization starts bounded background preparation for those servers. This is an environment-use predictor, not a learned dependency graph or speculative tool execution. Failed preparation is counted and ordinary authoritative work may initialize a new session later.
+Defaults under `[limits]`:
 
-Reuse requires a named, operator-approved tool rule with `reusable = true` and a nonzero TTL. The tool must have no required issue-time effect and must be valid for the key's arguments, user/grants, session-independence contract, server revision and catalog digest during the declared freshness interval. Unknown tools bypass reuse. A server's `readOnlyHint` is insufficient; the owned counter fixture intentionally lies about that annotation and still runs twice.
+| Setting | Default | Controls |
+| --- | ---: | --- |
+| `max_connections` | 2048 | Accepted TCP connections |
+| `connection_idle_ms` | 180000 | Connection read inactivity |
+| `body_readers` | 64 | Concurrent authenticated body reads |
+| `admin_requests` | 16 | Separate admin admission |
+| `request_bytes` | 1048576 | One inbound body |
+| `buffered_bytes` | 33554432 | Complete ordinary bodies held by handlers |
+| `upstream_calls` | 512 | Tool calls across all servers |
+| `upstream_initializations` | 64 | Handshakes and catalog preparation |
+| `upstream_idle_per_host` | 64 | Idle HTTP connections per server/host |
+| `cleanup_pending` | 4096 | Queued and active cleanup actions |
+| `shutdown_grace_ms` | 10000 | Grace for admitted work |
 
-Exact relevant arguments are bound from workflow inputs or previous complete MCP results. If the source-only input changes, unchanged dependency-tool results remain reusable. The gateway's current granularity is individual tool results; the original fixture engine also demonstrates complete two-tool fragment reuse. Neither is an external dependency tracker. For changing resources, leave reuse disabled until a reliable revision witness or an explicitly accepted bounded-staleness policy is available.
+Excess requests receive HTTP 503 or a JSON-RPC capacity error; session capacity returns HTTP 429. Admitted calls wait for server/global quotas under their deadline. Cancellation notifications bypass MCP request admission. Admin slots share the outer TCP connection cap.
 
-A same-key miss takes a bounded singleflight guard and rechecks the store. A matching successful follower can return `joined`; a retained hit returns `reused`; fresh reusable work returns `executed`; ineligible work returns `bypassed`. A leader failure releases the guard without retaining an error. Followers remain authoritative requests, and may issue their own eligible read after a failed leader; this is not a detached task or a shared execution lease.
+The HTTP deadline includes body reading and execution. Body reads also have a five-second cap. Stdio execution deadlines start after a complete line. Upstream responses, combined catalogs and retained workflow tool results have 1 MiB caps. Catalogs allow 16 pages and 512 tools. The cache holds 512 entries and 16 MiB of accounted payload, with 128 singleflight keys.
 
-Cancellation, revocation, disconnection or timeout drops local work. Stdio cancellation invalidates that subprocess; HTTP cancellation discards the local session handle. Already-issued remote effects may continue, and an abandoned remote session relies on the server's expiry policy. A later **distinct invocation** can initialize a fresh connection. Waypilot never automatically replays the failed invocation, including HTTP 404, a dropped response or an uncertain effect. Workflows provide no transaction rollback.
+Byte budgets exclude decoded JSON, responses and allocator overhead. Readers may hold another `body_readers * request_bytes` before complete-body admission. Set OS/container memory and descriptor limits too.
 
-## Hosting and observability
+Idle maintenance runs every 250 ms and preserves active work. SIGINT/SIGTERM makes `/healthz` return 503, rejects new work and allows the configured shutdown grace. The service then cancels sessions, allows up to three more seconds for preparation/cleanup and stops network reads and writes. Stdio EOF and input errors also trigger cleanup. Readiness returns 200 otherwise; it does not probe upstream health.
 
-Bind to loopback by default. For a self-hosted deployment, use your normal TLS ingress, secret injection, connection/header limits and access logs. The operator configuration can launch programs and contact configured addresses, so it belongs to the host's trust boundary. It is not user-supplied executable configuration or a sandbox. Upstream redirects and environment proxy discovery are disabled; private CAs and explicit proxy configuration are not exposed as options in this prototype.
+HTTP cleanup queues cancellation and DELETE for known sessions. At most 32 cleanup actions run at once, each with a two-second timeout. `/admin/stats` reports pending work, errors and drops. An abandoned initialization keeps its preparation deadline so it can receive and delete the session ID. If the server never returns that ID, its own expiry policy must reclaim the session. DELETE 405 is tolerated. Stdio cancellation invalidates its process.
 
-Requests with an `Origin` header are denied unless that exact origin is in `allowed_origins`. The service does not implement browser CORS preflight; the intended clients are MCP applications and SDKs. Use HTTPS for remote clients and servers; upstream cleartext requires loopback or explicit opt-in.
+Cleanup is best effort. Remote effects can finish after local cancellation. A failed invocation is never replayed or rolled back; a later distinct invocation may open a fresh session.
 
-Set standard OTLP trace environment variables as shown in the README. `gateway.http`, `mcp.gateway.request`, `mcp.prepare`, `mcp.invoke` and `workflow.node` spans show time spent inside Waypilot. Wayframe node spans record dependency wait, scheduler wait, execution and outcome. These are local trace trees; incoming W3C trace extraction and upstream trace-header propagation are not implemented yet. Trace durations are not billing-grade per-request accounting, and overlapping spans must not be summed as elapsed time.
+## Tracing
 
-SIGINT/SIGTERM stop the HTTP server, cancel sessions and attempt bounded cleanup. `/healthz` remains deliberately lightweight. There is no durable recovery journal, multi-replica invalidation bus or persistent session store in this prototype.
+```sh
+OTEL_SERVICE_NAME=waypilot \
+OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://localhost:4318/v1/traces \
+OTEL_EXPORTER_OTLP_TRACES_PROTOCOL=http/json \
+target/debug/waypilot serve --config examples/local.toml
+```
+
+Spans cover ingress, MCP requests, preparation, invocation and graph nodes. Node fields separate dependency wait, scheduler wait and execution. Results include elapsed time and `executed`, `reused`, `joined` or `bypassed` under `_meta["io.waypilot/runtime"]`. Application trace fields exclude arguments, credentials and results.
+
+The exporter also supports `http/protobuf`. Incoming W3C context extraction and upstream trace propagation are unsupported. Overlapping span durations do not add up to elapsed request time.
