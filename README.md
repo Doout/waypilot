@@ -1,8 +1,8 @@
 # Waypilot
 
-An experimental MCP execution runtime built on [Wayframe](https://github.com/Doout/wayframe). Point an MCP client at Waypilot and route tool calls to local processes or remote MCP servers. Explicit workflows can run independent tool branches in parallel, join their results, and continue with synchronous work.
+An MCP execution service built on [Wayframe](https://github.com/Doout/wayframe). Point an MCP client at Waypilot and route tool calls to local processes or remote MCP servers. Explicit workflows can run independent tool branches in parallel, join their results, and continue with synchronous work.
 
-The runnable prototype includes authenticated HTTP and local stdio ingress, tool grants, rate limits, bounded sessions, cancellation, exact result reuse, environment prewarming, and OpenTelemetry export. It works without an agent or model API. Automatic workflow mining and speculative tool invocation remain planned work.
+The service includes authenticated HTTP and local stdio ingress, tool grants, rate limits, bounded connections and memory admission, durable user revocation, cancellation, exact result reuse, environment prewarming, and OpenTelemetry export. It works without an agent or model API. Automatic workflow mining and speculative tool invocation remain planned work.
 
 ## Run the demo
 
@@ -77,7 +77,7 @@ For a local MCP client that launches its server over stdio, use the absolute pat
 
 ## Configure your own servers
 
-Configuration is TOML; secrets are read from named environment variables. Start with either file in [examples](examples). A minimal remote configuration is:
+Configuration is TOML; secrets are read from named environment variables. Start with [the local workflow](examples/local.toml), [a remote server](examples/microsoft-learn.toml), or [the 1,000-client service configuration](examples/service.toml). A minimal remote configuration is:
 
 ```toml
 listen = "127.0.0.1:7400"
@@ -133,7 +133,7 @@ target/debug/waypilot admin --url http://127.0.0.1:7400 \
   --token-env WAYPILOT_ADMIN_TOKEN --action disable --user developer
 ```
 
-Actions also include `enable` and `invalidate`. Disabling a user cancels their sessions, prevents queued dispatch and blocks cached results. Enabling requires a new session. Every administrative change increments the global generation and clears retained results conservatively. **Enable/disable overrides are in memory**; edit the configuration and restart for durable changes. This prototype does not provide an identity provider, self-service registration or OAuth.
+Actions also include `enable` and `invalidate`. Disabling a user cancels their sessions, prevents queued dispatch and blocks cached results. Enabling requires a new session. Every administrative change increments the global generation and clears retained results conservatively. Set `state_path = "../var/policy.json"` to persist enable/disable overrides across restart. An update is acknowledged after an atomic, synced write and in-memory publication; an unwritable state file fails startup. One process owns that file. Without `state_path`, overrides remain in memory. Users, credentials, grants and rate settings still come from TOML/environment. There is no identity provider, self-service registration or OAuth.
 
 ## Test
 
@@ -145,7 +145,18 @@ export WAYPILOT_SDK_PYTHON="$PWD/target/sdk-venv/bin/python"
 bash scripts/verify.sh
 ```
 
-Verification runs Rust tests, formatting, Clippy with warnings denied, Python syntax checks, live JSON/SSE and stdio peers, the independent official Python MCP SDK, and an actual OTLP collector. Regressions cover reuse and partial recomputation, identity isolation, grants, rate limits, learned preparation, session binding, deadlines, cancellation, revocation while queued, malformed requests, and lost responses after effects. CI repeats this on Linux and macOS and uploads raw benchmark and demo output.
+Verification runs Rust tests, formatting, Clippy with warnings denied, Python syntax checks, live JSON/SSE and stdio peers, the independent official Python MCP SDK, an actual OTLP collector, and a 64-client/32-call scale smoke test with sampled traces. Regressions cover reuse and partial recomputation, identity isolation, grants, rate limits, learned preparation, session binding, deadlines, cancellation, revocation while queued, malformed requests, and lost responses after effects. CI repeats this on Linux and macOS. Linux also qualifies 1,000 connected clients and 500 concurrent calls, including a 60-second open-loop workload at 500 calls/second. CI uploads raw qualification, benchmark and demo output even on failure.
+
+To run the full single-node qualification locally:
+
+```sh
+cargo build --locked --release
+python3 load/qualify.py target/release/waypilot \
+  --clients 1000 --concurrency 500 --seconds 60 --rate 500 \
+  --output target/scale-qualification.json
+```
+
+Add `--trace-ratio 0.1` for an owned OTLP collector and sampled export. The suite checks actual upstream concurrency, parallel workflows, overload, large bodies, cancellation, deadlines, session churn, identity isolation, no replay of uncertain effects, queued revocation, persistence, idle expiry and graceful shutdown. It records every sustained-load latency trial, generator lag, sampled RSS and descriptors. See [scale methodology and limits](docs/scale.md).
 
 ## Benchmarks and traces
 
@@ -171,10 +182,10 @@ Spans cover HTTP ingress, MCP requests, preparation, invocation and Wayframe gra
 
 Supported ingress and upstream transports are stdio and classic MCP Streamable HTTP with JSON or SSE POST responses, negotiating `2025-11-25`, `2025-06-18`, or `2025-03-26`. HTTP ingress returns JSON. There is no legacy two-endpoint SSE, GET event stream, resumable delivery, server-initiated sampling/elicitation, OAuth exchange, durable jobs, or agent adapter yet. Full input JSON Schema validation is delegated to the upstream tool; workflow bindings are checked locally.
 
-Same-key reusable requests are coalesced with Wayframe's bounded singleflight store. Calls within one upstream session are serialized; different servers and downstream sessions can run concurrently. Cancellation drops the local invocation/session and permits a later distinct call to initialize afresh. Already-issued remote effects may complete. An uncertain call is never automatically retried or rolled back.
+Same-key reusable requests are coalesced with Wayframe's bounded singleflight store. Calls within one upstream session are serialized; different servers and downstream sessions can run concurrently. Cancellation drops the local invocation/session, queues bounded MCP cancellation and session deletion, and permits a later distinct call to initialize afresh. Cleanup failures and overflow are observable in admin stats. Already-issued remote effects may complete. An uncertain call is never automatically retried or rolled back.
 
 Learned prewarming uses per-user aggregate server-use frequencies to prepare permitted environments on later sessions. It sends initialization and catalog requests, never speculative `tools/call`. Automatic trace-derived workflows, dependency witnesses for mutable resources, speculative execution leases and durable continuations are future milestones in the [delivery plan](docs/plan.md).
 
-Wayframe supplies typed graphs, mandatory gates, bounded scheduling, deadlines, supervised processes, caching/singleflight and telemetry. This prototype uses public APIs pinned to `ec4d27224ec213eabc2eae9b474b522d1cab8874`; it needs no uncommitted sibling checkout or framework patch. [Architecture](docs/architecture.md) and [Wayframe evolution](docs/wayframe-plan.md) describe the boundaries.
+Wayframe supplies typed graphs, mandatory gates, bounded scheduling, deadlines, supervised processes, caching/singleflight and telemetry. The service uses public APIs pinned to `ec4d27224ec213eabc2eae9b474b522d1cab8874`; it needs no uncommitted sibling checkout or framework patch. [Architecture](docs/architecture.md) and [Wayframe evolution](docs/wayframe-plan.md) describe the boundaries.
 
-Apache-2.0. Experimental developer prototype.
+Apache-2.0. Pre-release; see the measured qualification and deployment limits before hosting.

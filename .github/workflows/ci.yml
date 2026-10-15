@@ -1,6 +1,7 @@
 name: verify
 on:
   push:
+    branches: [main]
   pull_request:
 permissions:
   contents: read
@@ -30,10 +31,19 @@ jobs:
           cargo run --locked --release -- demo --samples 10 > target/benchmark.json
           python3 demos/mcp_demo.py target/release/waypilot > target/mcp-demo.json
           python3 scripts/benchmark_gateway.py target/release/waypilot --samples 100 > target/gateway-benchmark.json
+      - name: Qualify 1,000 clients and 500 concurrent calls
+        if: runner.os == 'Linux'
+        run: |
+          python3 load/qualify.py target/release/waypilot \
+            --clients 1000 --concurrency 500 --seconds 60 --rate 500 \
+            --trace-ratio 0.1 --output target/scale-qualification.json
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: benchmark-${{ matrix.os }}
           path: |
             target/benchmark.json
             target/mcp-demo.json
             target/gateway-benchmark.json
+            target/scale-smoke.json
+            target/scale-qualification.json

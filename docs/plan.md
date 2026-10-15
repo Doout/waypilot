@@ -20,6 +20,12 @@ The service accepts real MCP calls over HTTP and stdio, forwards to configured l
 
 The repeatable demo verifies two parallel MCP branches, a synchronous join, four/zero/two tool-call counts, preparation without invocation, a mutable counter that never reuses results, and optional live Microsoft Learn tool calls. Linux/macOS CI uses owned JSON/SSE and stdio peers plus the independent official Python MCP SDK. This is a working MCP service, not automatic workflow compilation or speculative tool execution. See [operations](gateway.md) for supported transports and limits.
 
+## Single-node service qualification — implemented
+
+The service has independent resource budgets, shared HTTP transport pools with isolated logical MCP sessions, bounded remote cleanup, idle expiry, graceful drain and optional durable enabled-state overrides. The qualification target is 1,000 connected clients with 500 observed concurrent upstream calls. The suite exercises parallel DAGs and dependent effects, overload, cancellation, deadlines, byte pressure, queued revocation, restart, session churn and sampled OTLP export, followed by open-loop sustained traffic. Linux CI runs the full target and preserves raw reports. See [methodology and limits](scale.md) and [recorded measurements](validation.md).
+
+This is a first single-node pre-release qualification. Multi-replica coordination, durable execution, OAuth and longer deployment soaks remain separate work.
+
 ## M1: Explicit contracts and incremental fragments
 
 Waypilot: versioned tool catalog, pure/read/write/unknown effect declarations, argument bindings, resource read/write sets, privacy/disclosure eligibility, validity witnesses and fragment output schemas. Begin with operator-approved contracts. Keep unknown tools ordered and ineligible for speculation/reuse. Add nested fragments, branch selectors and resource-driven invalidation. Avoid persisting identities or secrets in learned profiles.

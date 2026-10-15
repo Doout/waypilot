@@ -18,12 +18,9 @@ use std::{
 use tracing::Instrument;
 
 impl Gateway {
-    pub fn router(self: &Arc<Self>) -> Router {
+    pub(super) fn router(self: &Arc<Self>) -> Router {
         Router::new()
-            .route(
-                "/healthz",
-                get(|| async { Json(json!({"status":"ready"})) }),
-            )
+            .route("/healthz", get(readiness))
             .route("/mcp", post(http_mcp).get(http_get).delete(http_delete))
             .route("/v1/prewarm", post(http_prewarm))
             .route("/admin/stats", get(admin_stats))
@@ -31,11 +28,23 @@ impl Gateway {
             .route("/admin/users/update", post(admin_update))
             .route("/admin/invalidate", post(admin_invalidate))
             .with_state(self.clone())
-            .layer(DefaultBodyLimit::max(MAX_MESSAGE))
+            .layer(DefaultBodyLimit::max(self.config.limits.request_bytes))
             .layer(axum::middleware::from_fn_with_state(
                 self.clone(),
                 http_guard,
             ))
+    }
+}
+
+async fn readiness(State(gateway): State<Arc<Gateway>>) -> Response {
+    if gateway.draining.load(Ordering::Acquire) {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"status":"draining"})),
+        )
+            .into_response()
+    } else {
+        Json(json!({"status":"ready"})).into_response()
     }
 }
 
@@ -96,13 +105,23 @@ async fn http_guard(
             (StatusCode::UNAUTHORIZED, [("WWW-Authenticate", "Bearer")]).into_response()
         };
     }
+    let admin = request.uri().path().starts_with("/admin/");
+    let readers = if admin {
+        gateway.admin_admission.clone()
+    } else {
+        gateway.body_readers.clone()
+    };
+    let Ok(read_slot) = readers.try_acquire_owned() else {
+        gateway.metrics.rejected.fetch_add(1, Ordering::Relaxed);
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
     // Bound every endpoint's body read, including administrative JSON extractors.
     let deadline =
         tokio::time::Instant::now() + Duration::from_millis(gateway.config.request_timeout_ms);
     let (parts, body) = request.into_parts();
     let bytes = match tokio::time::timeout_at(
         deadline.min(tokio::time::Instant::now() + Duration::from_secs(5)),
-        to_bytes(body, MAX_MESSAGE),
+        to_bytes(body, gateway.config.limits.request_bytes),
     )
     .await
     {
@@ -110,6 +129,28 @@ async fn http_guard(
         Ok(Err(_)) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
         Err(_) => return StatusCode::REQUEST_TIMEOUT.into_response(),
     };
+    let byte_slot = if admin {
+        None
+    } else {
+        match gateway
+            .body_bytes
+            .clone()
+            .try_acquire_many_owned(bytes.len() as u32)
+        {
+            Ok(slot) => Some(slot),
+            Err(_) => {
+                gateway.metrics.rejected.fetch_add(1, Ordering::Relaxed);
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+        }
+    };
+    let _admin_slot = if admin {
+        Some(read_slot)
+    } else {
+        drop(read_slot);
+        None
+    };
+    let _byte_slot = byte_slot;
     let mut request = Request::from_parts(parts, Body::from(bytes));
     request.extensions_mut().insert(HttpDeadline(deadline));
     tokio::time::timeout_at(deadline, next.run(request))
@@ -295,8 +336,7 @@ async fn admin_stats(State(gateway): State<Arc<Gateway>>, headers: HeaderMap) ->
     if !admin_authorized(&gateway, &headers) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    let metrics = &gateway.metrics;
-    Json(json!({"generation":gateway.epoch.load(Ordering::Acquire),"sessions":gateway.sessions.lock().expect("sessions poisoned").len(),"requests":metrics.requests.load(Ordering::Relaxed),"upstream_calls":metrics.upstream_calls.load(Ordering::Relaxed),"cache_hits":metrics.cache_hits.load(Ordering::Relaxed),"cache_misses":metrics.cache_misses.load(Ordering::Relaxed),"cache_bypasses":metrics.cache_bypasses.load(Ordering::Relaxed),"denied":metrics.denied.load(Ordering::Relaxed),"prewarms":metrics.prewarms.load(Ordering::Relaxed),"prewarm_errors":metrics.prewarm_errors.load(Ordering::Relaxed),"cache":gateway.cache.stats().unwrap_or(Value::Null)})).into_response()
+    Json(gateway.snapshot()).into_response()
 }
 async fn admin_users(State(gateway): State<Arc<Gateway>>, headers: HeaderMap) -> Response {
     if !admin_authorized(&gateway, &headers) {
@@ -321,22 +361,26 @@ async fn admin_update(
     let Some(actor) = gateway.actors.iter().find(|actor| actor.settings.id == id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    actor.enabled.store(enabled, Ordering::Release);
-    let generation = gateway.epoch.fetch_add(1, Ordering::AcqRel) + 1;
-    let _ = gateway.cache.invalidate_generation(generation);
-    if !enabled {
-        for session in gateway
-            .sessions
-            .lock()
-            .expect("sessions poisoned")
-            .values()
-            .filter(|session| session.actor.settings.id == id)
-        {
-            session.cancel();
+    let mut policy = gateway.policy.clone().lock_owned().await;
+    let actor = actor.clone();
+    let id = id.to_owned();
+    // Persistence and publication share one owned transaction. Disconnecting the
+    // admin caller cannot leave disk and the running authorization table split.
+    match tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
+        policy.set(&id, enabled)?;
+        actor.enabled.store(enabled, Ordering::Release);
+        let generation = gateway.epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        gateway.cache.invalidate_generation(generation)?;
+        if !enabled {
+            let mut sessions = gateway.sessions.lock().expect("sessions poisoned");
+            let ids: Vec<_> = sessions.iter().filter(|(_,session)| session.actor.settings.id == id).map(|(id,_)| id.clone()).collect();
+            for id in ids { if let Some(session) = sessions.remove(&id) { session.cancel(); } }
         }
+        Ok(json!({"id":id,"enabled":enabled,"generation":generation,"persistent":policy.persistent()}))
+    }).await {
+        Ok(Ok(value)) => Json(value).into_response(),
+        _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
-    Json(json!({"id":id,"enabled":enabled,"generation":generation,"persistent":false}))
-        .into_response()
 }
 async fn admin_invalidate(State(gateway): State<Arc<Gateway>>, headers: HeaderMap) -> Response {
     if !admin_authorized(&gateway, &headers) {

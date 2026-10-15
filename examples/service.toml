@@ -1,0 +1,38 @@
+# Replace the endpoint and grants for your deployment. Secrets come from the environment.
+listen = "127.0.0.1:7400"
+admin_token_env = "WAYPILOT_ADMIN_TOKEN"
+state_path = "../var/policy.json"
+request_timeout_ms = 30000
+max_sessions = 1100
+max_in_flight = 500
+session_ttl_seconds = 900
+
+[limits]
+max_connections = 1800
+connection_idle_ms = 180000
+body_readers = 500
+admin_requests = 16
+request_bytes = 65536
+buffered_bytes = 16777216
+upstream_calls = 500
+upstream_initializations = 64
+upstream_idle_per_host = 500
+cleanup_pending = 2200
+shutdown_grace_ms = 10000
+
+[[users]]
+id = "developer"
+tenant = "local"
+token_env = "WAYPILOT_TOKEN"
+tools = ["tools__*"]
+requests_per_second = 500
+burst = 1000
+
+[[servers]]
+id = "tools"
+revision = "operator-contract-v1"
+max_in_flight = 500
+[servers.endpoint]
+transport = "http"
+url = "https://your-server.example/mcp"
+# bearer_env = "TOOLS_MCP_TOKEN"

@@ -8,6 +8,10 @@ JSON and SSE upstream modes are measured separately. Output includes all trials,
 
 Trace export is off unless explicitly configured through the environment. Run a separate trace-enabled comparison before making exporter-overhead claims. Do not subtract p95 values to infer a p95 overhead distribution; raw paired samples are available for further analysis.
 
+## Single-node capacity and sustained traffic
+
+[The scale suite](scale.md) tests 1,000 connected clients and 500 observed concurrent upstream calls with owned asynchronous HTTP peers. Its open-loop sustained workload records latency from the scheduled send time, generator lag, every output assertion, resource samples and trace-export counts. Capacity barriers, failure recovery and sustained throughput are separate assertions. Run tracing off/on separately and retain the raw JSON. The sequential forwarding benchmark above remains the comparison against the previous release; a scale pass is not a substitute for an overhead comparison.
+
 ## Fixture optimization workload
 
 Two MCP servers run local deterministic tools over immutable content snapshots. Each server has two dependent calls; the two server branches are independent. A server starts with a 60 ms fixture delay, each tool has a 15 ms fixture delay, and a 100 ms simulated reasoning gap precedes authoritative work. Real subprocess startup, MCP handshake, serialization, scheduling, tracing and cache operations remain measured.

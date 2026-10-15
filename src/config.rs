@@ -6,7 +6,7 @@ use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
     net::SocketAddr,
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -25,10 +25,51 @@ pub struct Config {
     pub max_in_flight: usize,
     #[serde(default = "session_ttl")]
     pub session_ttl_seconds: u64,
+    #[serde(default)]
+    pub limits: ResourceLimits,
+    #[serde(default)]
+    pub state_path: Option<PathBuf>,
     pub users: Vec<User>,
     pub servers: Vec<Server>,
     #[serde(default)]
     pub workflows: Vec<Workflow>,
+}
+/// Independent resource budgets; request admission is not a memory or socket bound.
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ResourceLimits {
+    pub max_connections: usize,
+    pub connection_idle_ms: u64,
+    pub body_readers: usize,
+    pub admin_requests: usize,
+    pub request_bytes: usize,
+    pub buffered_bytes: usize,
+    pub upstream_calls: usize,
+    pub upstream_initializations: usize,
+    pub upstream_idle_per_host: usize,
+    pub cleanup_pending: usize,
+    pub shutdown_grace_ms: u64,
+}
+impl Default for ResourceLimits {
+    fn default() -> Self {
+        Self {
+            max_connections: 2048,
+            connection_idle_ms: 180_000,
+            body_readers: 64,
+            admin_requests: 16,
+            request_bytes: 1024 * 1024,
+            buffered_bytes: 32 * 1024 * 1024,
+            upstream_calls: 512,
+            upstream_initializations: 64,
+            upstream_idle_per_host: 64,
+            cleanup_pending: 4096,
+            shutdown_grace_ms: 10_000,
+        }
+    }
+}
+
+fn server_calls() -> usize {
+    512
 }
 fn listen() -> SocketAddr {
     "127.0.0.1:7400".parse().expect("literal address")
@@ -78,6 +119,8 @@ pub struct Server {
     pub endpoint: Endpoint,
     #[serde(default)]
     pub prewarm: bool,
+    #[serde(default = "server_calls")]
+    pub max_in_flight: usize,
     #[serde(default)]
     pub tools: BTreeMap<String, ToolRule>,
 }
@@ -165,6 +208,11 @@ impl Config {
                 }
             }
         }
+        if let Some(state) = &mut config.state_path {
+            if state.is_relative() {
+                *state = directory.join(&*state);
+            }
+        }
         config.validate()?;
         Ok(config)
     }
@@ -176,10 +224,25 @@ impl Config {
         );
         ensure!(
             (100..=120_000).contains(&self.request_timeout_ms)
-                && (1..=1024).contains(&self.max_sessions)
-                && (1..=256).contains(&self.max_in_flight)
+                && (1..=100_000).contains(&self.max_sessions)
+                && (1..=4096).contains(&self.max_in_flight)
                 && (10..=3600).contains(&self.session_ttl_seconds),
             "invalid runtime limits"
+        );
+        let limits = &self.limits;
+        ensure!(
+            (16..=100_000).contains(&limits.max_connections)
+                && (1000..=600_000).contains(&limits.connection_idle_ms)
+                && (1..=4096).contains(&limits.body_readers)
+                && (1..=256).contains(&limits.admin_requests)
+                && (1024..=1024 * 1024).contains(&limits.request_bytes)
+                && (limits.request_bytes..=1024 * 1024 * 1024).contains(&limits.buffered_bytes)
+                && (1..=8192).contains(&limits.upstream_calls)
+                && (1..=1024).contains(&limits.upstream_initializations)
+                && (0..=8192).contains(&limits.upstream_idle_per_host)
+                && (16..=100_000).contains(&limits.cleanup_pending)
+                && (100..=120_000).contains(&limits.shutdown_grace_ms),
+            "invalid resource budgets"
         );
         ensure!(
             !self.users.is_empty()
@@ -230,6 +293,10 @@ impl Config {
                     && !server.revision.chars().any(char::is_control)
                     && server.tools.len() <= 512,
                 "invalid server revision/rules"
+            );
+            ensure!(
+                (1..=8192).contains(&server.max_in_flight),
+                "invalid upstream call budget"
             );
             server.endpoint.validate()?;
             for (tool, rule) in &server.tools {

@@ -2,7 +2,7 @@
 use crate::{
     config::{self, Config, Server, User},
     mcp::digest,
-    upstream::{Catalog, Client, MAX_MESSAGE},
+    upstream::{Catalog, Client, Connector, MAX_MESSAGE},
 };
 use anyhow::{ensure, Context, Result};
 use axum::http::HeaderMap;
@@ -23,6 +23,7 @@ use tracing::Instrument;
 use wayframe_cache::{Cache, Key, Scope};
 
 mod http;
+mod network;
 mod stdio;
 pub use stdio::serve_stdio;
 
@@ -88,6 +89,9 @@ struct Metrics {
     denied: AtomicU64,
     prewarms: AtomicU64,
     prewarm_errors: AtomicU64,
+    rejected: AtomicU64,
+    expired: AtomicU64,
+    connections: Arc<AtomicU64>,
 }
 
 #[derive(Default)]
@@ -109,6 +113,17 @@ pub struct Gateway {
     metrics: Metrics,
     pub(crate) workflows: BTreeMap<String, crate::workflow::Compiled>,
     direct: crate::workflow::Single,
+    connectors: BTreeMap<String, Arc<Connector>>,
+    server_admission: BTreeMap<String, Arc<Semaphore>>,
+    upstream_admission: Arc<Semaphore>,
+    preparing: Arc<Semaphore>,
+    body_readers: Arc<Semaphore>,
+    body_bytes: Arc<Semaphore>,
+    admin_admission: Arc<Semaphore>,
+    cleanup: Arc<crate::upstream_cleanup::Cleanup>,
+    policy: Arc<tokio::sync::Mutex<crate::policy::Policy>>,
+    draining: AtomicBool,
+    network_stop: CancellationToken,
 }
 
 #[derive(Debug)]
@@ -142,6 +157,14 @@ impl Gateway {
         config.validate()?;
         let admin_hash = secret(&config.admin_token_env)?;
         let mut hashes = BTreeSet::from([admin_hash.clone()]);
+        let policy = crate::policy::Policy::load(
+            config.state_path.clone(),
+            &config
+                .users
+                .iter()
+                .map(|user| user.id.clone())
+                .collect::<Vec<_>>(),
+        )?;
         let mut actors = Vec::new();
         for user in &config.users {
             let token_hash = secret(&user.token_env)?;
@@ -152,7 +175,7 @@ impl Gateway {
             actors.push(Arc::new(Actor {
                 settings: user.clone(),
                 token_hash,
-                enabled: AtomicBool::new(user.enabled),
+                enabled: AtomicBool::new(policy.enabled(&user.id, user.enabled)),
                 bucket: Mutex::new(Bucket {
                     tokens: user.burst as f64,
                     updated: Instant::now(),
@@ -166,8 +189,38 @@ impl Gateway {
                 crate::workflow::Compiled::new(definition.clone(), config.max_in_flight)?,
             );
         }
+        let cleanup = crate::upstream_cleanup::Cleanup::new(config.limits.cleanup_pending);
+        let preparing = Arc::new(Semaphore::new(config.limits.upstream_initializations));
+        let mut connectors = BTreeMap::new();
+        let mut server_admission = BTreeMap::new();
+        for server in &config.servers {
+            connectors.insert(
+                server.id.clone(),
+                Connector::new(
+                    server.endpoint.clone(),
+                    Some(cleanup.clone()),
+                    config.limits.upstream_idle_per_host,
+                    preparing.clone(),
+                )?,
+            );
+            server_admission.insert(
+                server.id.clone(),
+                Arc::new(Semaphore::new(server.max_in_flight)),
+            );
+        }
         Ok(Arc::new(Self {
             direct: crate::workflow::Single::new(config.max_in_flight)?,
+            body_readers: Arc::new(Semaphore::new(config.limits.body_readers)),
+            body_bytes: Arc::new(Semaphore::new(config.limits.buffered_bytes)),
+            admin_admission: Arc::new(Semaphore::new(config.limits.admin_requests)),
+            upstream_admission: Arc::new(Semaphore::new(config.limits.upstream_calls)),
+            cleanup,
+            preparing,
+            connectors,
+            server_admission,
+            policy: Arc::new(tokio::sync::Mutex::new(policy)),
+            draining: AtomicBool::new(false),
+            network_stop: CancellationToken::new(),
             admission: Arc::new(Semaphore::new(config.max_in_flight)),
             warming: Arc::new(Semaphore::new(2)),
             config,
@@ -230,20 +283,8 @@ impl Gateway {
     }
 
     fn create_session(&self, actor: Arc<Actor>, version: &str) -> Result<Arc<Session>> {
+        ensure!(!self.draining.load(Ordering::Acquire), "gateway draining");
         let mut sessions = self.sessions.lock().expect("sessions poisoned");
-        let ttl = Duration::from_secs(self.config.session_ttl_seconds);
-        sessions.retain(|_, session| {
-            let keep = session
-                .touched
-                .lock()
-                .expect("session clock poisoned")
-                .elapsed()
-                < ttl;
-            if !keep {
-                session.cancel();
-            }
-            keep
-        });
         ensure!(
             sessions.len() < self.config.max_sessions,
             "session capacity reached"
@@ -253,9 +294,9 @@ impl Gateway {
             if server_allowed(&actor, server) {
                 clients.insert(
                     server.id.clone(),
-                    Arc::new(Client::metered(
-                        server.endpoint.clone(),
-                        self.metrics.upstream_calls.clone(),
+                    Arc::new(Client::with_connector(
+                        self.connectors[&server.id].clone(),
+                        Some(self.metrics.upstream_calls.clone()),
                     )?),
                 );
             }
@@ -289,7 +330,13 @@ impl Gateway {
             return None;
         }
         let mut touched = session.touched.lock().expect("session clock poisoned");
-        if touched.elapsed() >= Duration::from_secs(self.config.session_ttl_seconds) {
+        if touched.elapsed() >= Duration::from_secs(self.config.session_ttl_seconds)
+            && session
+                .jobs
+                .lock()
+                .expect("session jobs poisoned")
+                .is_empty()
+        {
             session.cancel();
             return None;
         }
@@ -325,9 +372,18 @@ impl Gateway {
         let catalog = client
             .catalog_checked(deadline, || self.live(&session, epoch))
             .await
-            .map_err(|_| Fault {
-                code: -32002,
-                message: "upstream initialization or catalog failed",
+            .map_err(|error| {
+                if let Err(denied) = self.authorize(&session, name, epoch) {
+                    return denied;
+                }
+                tracing::warn!(
+                    cause = crate::upstream::failure_kind(&error),
+                    "upstream preparation failed"
+                );
+                Fault {
+                    code: -32002,
+                    message: "upstream initialization or catalog failed",
+                }
             })?;
         if !catalog
             .tools
@@ -436,6 +492,25 @@ impl Gateway {
         epoch: u64,
     ) -> Result<Value, Fault> {
         let tool = exposed.split_once("__").ok_or_else(Fault::invalid)?.1;
+        let server = exposed.split_once("__").ok_or_else(Fault::invalid)?.0;
+        let _server_slot = tokio::time::timeout_at(
+            deadline,
+            self.server_admission[server].clone().acquire_owned(),
+        )
+        .await
+        .map_err(|_| Fault {
+            code: -32008,
+            message: "upstream queue deadline exceeded",
+        })?
+        .map_err(|_| Fault::denied())?;
+        let _global_slot =
+            tokio::time::timeout_at(deadline, self.upstream_admission.clone().acquire_owned())
+                .await
+                .map_err(|_| Fault {
+                    code: -32008,
+                    message: "upstream queue deadline exceeded",
+                })?
+                .map_err(|_| Fault::denied())?;
         self.authorize(session, exposed, epoch)?;
         client
             .call_checked(tool, arguments, deadline, || {
@@ -443,9 +518,17 @@ impl Gateway {
                     .map_err(|_| anyhow::anyhow!("tool access changed"))
             })
             .await
-            .map_err(|_| Fault {
-                code: -32002,
-                message: "upstream invocation failed; it was not replayed",
+            .map_err(|error| {
+                tracing::warn!(
+                    cause = crate::upstream::failure_kind(&error),
+                    server,
+                    tool,
+                    "upstream invocation failed"
+                );
+                Fault {
+                    code: -32002,
+                    message: "upstream invocation failed; it was not replayed",
+                }
             })
     }
 
@@ -667,9 +750,15 @@ impl Gateway {
                 "session initialization is incomplete",
             ));
         }
+        if self.draining.load(Ordering::Acquire) {
+            return Some(rpc_error(id, -32000, "gateway draining"));
+        }
         let _capacity = match self.admission.clone().try_acquire_owned() {
             Ok(capacity) => capacity,
-            Err(_) => return Some(rpc_error(id, -32029, "gateway request capacity exceeded")),
+            Err(_) => {
+                self.metrics.rejected.fetch_add(1, Ordering::Relaxed);
+                return Some(rpc_error(id, -32029, "gateway request capacity exceeded"));
+            }
         };
         let token = CancellationToken::new();
         {
@@ -732,6 +821,14 @@ impl Gateway {
     }
 
     pub async fn shutdown(&self) {
+        self.draining.store(true, Ordering::Release);
+        let deadline = tokio::time::Instant::now()
+            + Duration::from_millis(self.config.limits.shutdown_grace_ms);
+        while self.admission.available_permits() < self.config.max_in_flight
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         let sessions: Vec<_> = self
             .sessions
             .lock()
@@ -739,18 +836,81 @@ impl Gateway {
             .drain()
             .map(|(_, session)| session)
             .collect();
+        self.close_sessions(sessions).await;
+        let cleanup_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while self.preparing.available_permits() < self.config.limits.upstream_initializations
+            && tokio::time::Instant::now() < cleanup_deadline
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        self.cleanup.drain(cleanup_deadline).await;
+        self.network_stop.cancel();
+    }
+
+    async fn close_sessions(&self, sessions: Vec<Arc<Session>>) {
+        use futures_util::StreamExt;
         for session in &sessions {
             session.cancel();
         }
-        let clients: Vec<_> = sessions
-            .iter()
-            .flat_map(|session| session.clients.values().cloned())
-            .collect();
-        let _ = tokio::time::timeout(
-            Duration::from_secs(3),
-            futures_util::future::join_all(clients.iter().map(|client| client.close())),
-        )
-        .await;
+        futures_util::stream::iter(sessions)
+            .for_each_concurrent(32, |session| async move {
+                for client in session.clients.values() {
+                    client.close().await;
+                }
+            })
+            .await;
+    }
+
+    async fn maintain(self: Arc<Self>) {
+        let mut interval = tokio::time::interval(Duration::from_millis(250));
+        loop {
+            tokio::select! { _ = self.network_stop.cancelled() => break, _ = interval.tick() => {} }
+            let expired = {
+                let mut sessions = self.sessions.lock().expect("sessions poisoned");
+                let ids: Vec<_> = sessions
+                    .iter()
+                    .filter(|(_, session)| {
+                        session.stopped.is_cancelled()
+                            || (session
+                                .touched
+                                .lock()
+                                .expect("session clock poisoned")
+                                .elapsed()
+                                >= Duration::from_secs(self.config.session_ttl_seconds)
+                                && session
+                                    .jobs
+                                    .lock()
+                                    .expect("session jobs poisoned")
+                                    .is_empty())
+                    })
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                ids.into_iter()
+                    .filter_map(|id| sessions.remove(&id))
+                    .collect::<Vec<_>>()
+            };
+            self.metrics
+                .expired
+                .fetch_add(expired.len() as u64, Ordering::Relaxed);
+            self.close_sessions(expired).await;
+        }
+    }
+
+    fn snapshot(&self) -> Value {
+        let metrics = &self.metrics;
+        json!({"generation":self.epoch.load(Ordering::Acquire),"sessions":self.sessions.lock().expect("sessions poisoned").len(),
+            "requests":metrics.requests.load(Ordering::Relaxed),"upstream_calls":metrics.upstream_calls.load(Ordering::Relaxed),
+            "cache_hits":metrics.cache_hits.load(Ordering::Relaxed),"cache_misses":metrics.cache_misses.load(Ordering::Relaxed),
+            "cache_bypasses":metrics.cache_bypasses.load(Ordering::Relaxed),"denied":metrics.denied.load(Ordering::Relaxed),
+            "prewarms":metrics.prewarms.load(Ordering::Relaxed),"prewarm_errors":metrics.prewarm_errors.load(Ordering::Relaxed),
+            "rejected_capacity":metrics.rejected.load(Ordering::Relaxed),"sessions_expired":metrics.expired.load(Ordering::Relaxed),
+            "active_requests":self.config.max_in_flight-self.admission.available_permits(),
+            "active_upstream":self.config.limits.upstream_calls-self.upstream_admission.available_permits(),
+            "active_initializations":self.config.limits.upstream_initializations-self.preparing.available_permits(),
+            "body_readers":self.config.limits.body_readers-self.body_readers.available_permits(),
+            "buffered_bytes":self.config.limits.buffered_bytes-self.body_bytes.available_permits(),
+            "connections":metrics.connections.load(Ordering::Relaxed),"draining":self.draining.load(Ordering::Relaxed),
+            "cleanup":self.cleanup.stats(),"cache":self.cache.stats().unwrap_or(Value::Null)})
     }
 }
 
@@ -765,6 +925,7 @@ impl Drop for Job {
             .lock()
             .expect("jobs poisoned")
             .remove(&self.id);
+        *self.session.touched.lock().expect("session clock poisoned") = Instant::now();
     }
 }
 

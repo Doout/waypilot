@@ -105,8 +105,8 @@ fn gate(call: &Call, required: &[String]) -> Decision {
 fn limits(parallel: usize) -> Limits {
     Limits {
         max_parallel: parallel.min(4),
-        max_executions: 32,
-        max_running_nodes: 256,
+        max_executions: parallel,
+        max_running_nodes: parallel.saturating_mul(4),
     }
 }
 fn failure(call: &Call, error: Error) -> Fault {

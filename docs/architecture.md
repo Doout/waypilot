@@ -21,9 +21,9 @@ flowchart LR
 
 A direct tool call uses a compiled authorize → invoke → authorize-release graph. An authored virtual tool uses an immutable DAG compiled from configured argument bindings. Independent steps can run concurrently, previous results feed later steps, and a synchronous join collects selected outputs before release. All configured steps execute; selecting fewer output fields does not silently remove effects.
 
-`src/config.rs` owns trusted configuration and structural validation. `src/gateway.rs` owns identities, sessions, rate limits, prewarming and reuse; `gateway/http.rs` and `gateway/stdio.rs` own ingress lifecycles. `src/upstream.rs` owns MCP negotiation, catalogs and stdio/HTTP clients. `src/workflow.rs` translates authored bindings into Wayframe graphs.
+`src/config.rs` owns trusted configuration and structural validation. `src/gateway.rs` owns identities, sessions, rate limits, prewarming and reuse; `gateway/http.rs` and `gateway/stdio.rs` own ingress lifecycles. `src/upstream.rs` owns MCP negotiation, catalogs and stdio/HTTP clients. `upstream_cleanup.rs` owns bounded remote cleanup; `policy.rs` owns persisted enabled-state overrides; `gateway/network.rs` owns connection admission and service drain. `src/workflow.rs` translates authored bindings into Wayframe graphs.
 
-Every downstream session has separate upstream clients. Each client serializes its own connection operations; distinct servers and downstream sessions can run concurrently. Per-request admission, per-session job caps and separate prewarm admission bound active work. Operator-selected stdio principals use the same controls as HTTP users.
+Every downstream session has separate upstream clients. Each client serializes its own logical session operations; distinct servers and downstream sessions can run concurrently. A shared per-server HTTP transport pool reuses TCP connections without sharing MCP session IDs, catalogs or per-session credentials. Independent connection, body-reader, buffered-byte, initialization, global/per-server upstream-call, administrative and cleanup budgets bound each resource class. Graph admission follows the configured authoritative request capacity; each authored workflow runs at most four nodes concurrently. Operator-selected stdio principals use the same controls as HTTP users.
 
 ## Ownership
 
@@ -37,7 +37,7 @@ Every downstream session has separate upstream clients. Each client serializes i
 | Generic optional trace export | MCP-specific span fields and qualification reports |
 | Future work leases and continuation primitives | Resource witnesses, agent adapters and speculative promotion policy |
 
-The gateway consumes public crates from a pinned framework commit. No Wayframe code change was necessary for this prototype. Future extraction requires both a working Waypilot scenario and a non-agent use case.
+The gateway consumes public crates from a pinned framework commit. No Wayframe code change was necessary for this service. Future extraction requires both a working Waypilot scenario and a non-agent use case.
 
 ## Validity and controls
 
@@ -53,7 +53,9 @@ A TTL bounds retention; it does not prove current external state. Session-indepe
 
 The gateway learns per-user server-use frequency from successfully released tool results. After two observations it can prepare up to two permitted, opted-in environments on a new HTTP session. Preparation negotiates MCP, sends the initialized notification and validates the catalog. It issues no `tools/call`; initialization can still be visible to the remote service. Profiles are aggregate in-memory counts, not stored prompts, arguments or learned workflow structure.
 
-Cancellation is local control, not rollback. An invocation owns its connection while I/O is pending. Dropping that future discards the connection; a subsequent distinct invocation can initialize afresh, while the failed call is never replayed automatically. Already-issued HTTP effects may finish at the server. Stdio cancellation invalidates that subprocess, which is why unrelated requests cannot share an active stdio exchange.
+Cancellation is local control, not rollback. An invocation owns its connection while I/O is pending. Dropping that future queues bounded MCP cancellation and deletion for known HTTP session IDs; a subsequent distinct invocation can initialize afresh, while the failed call is never replayed automatically. Already-issued HTTP effects may finish at the server. Stdio cancellation invalidates that subprocess, which is why unrelated requests cannot share an active stdio exchange.
+
+Initialization has a separate bounded owner under the original deadline. If its caller disappears after the remote peer allocates a session, the owner can still receive the ID and queue its deletion. It stops further catalog work once abandonment is known and never issues tool calls. A peer that never returns the session ID still needs its own expiry policy.
 
 Singleflight serializes same-key eligible work; it does not create detached speculative tasks or independent consumer leases. A leader's successful retained result may satisfy a follower after current checks. Failed leaders store no result, so an authoritative follower can perform its own eligible read. General shared execution, independent cancellation ownership and speculative result promotion remain separate milestones.
 
