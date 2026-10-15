@@ -54,6 +54,7 @@ Choose a configuration:
 | [service.toml](examples/service.toml) | Resource limits and persistent user controls. Replace the server URL before use. |
 
 See the [gateway reference](docs/gateway.md) for clients, authentication, administration, reuse and tracing.
+The shared [research note](https://github.com/Doout/wayframe/blob/main/docs/research.md) covers related work, design limits and proposed experiments.
 
 ## Test and benchmark
 
