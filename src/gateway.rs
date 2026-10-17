@@ -172,8 +172,26 @@ pub(crate) struct Outcome {
 }
 
 impl Gateway {
+    fn cache_flight_capacity(config: &Config) -> usize {
+        // A request can run several independent workflow steps. Include queued
+        // computations, not just RPCs currently holding an upstream slot.
+        let steps = config
+            .workflows
+            .iter()
+            .map(|w| w.steps.len())
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        config.max_in_flight.saturating_mul(steps).min(10_000)
+    }
+
+    fn result_cache(config: &Config) -> Result<Cache<Value>> {
+        Cache::new(512, 16 * 1024 * 1024, Self::cache_flight_capacity(config))
+    }
+
     pub fn new(config: Config) -> Result<Arc<Self>> {
         config.validate()?;
+        let cache = Self::result_cache(&config)?;
         let admin_hash = secret(&config.admin_token_env)?;
         let mut hashes = BTreeSet::from([admin_hash.clone()]);
         let policy = crate::policy::Policy::load(
@@ -249,7 +267,7 @@ impl Gateway {
             admin_hash,
             sessions: Mutex::new(HashMap::new()),
             epoch: AtomicU64::new(1),
-            cache: Cache::new(512, 16 * 1024 * 1024, 128)?,
+            cache,
             profiles: Mutex::new(HashMap::new()),
             metrics: Metrics::default(),
             workflows,
@@ -1116,6 +1134,10 @@ impl Gateway {
 
     fn snapshot(&self) -> Value {
         let metrics = &self.metrics;
+        let mut cache = self.cache.stats().unwrap_or(Value::Null);
+        if cache.is_object() {
+            cache["flight_capacity"] = json!(Self::cache_flight_capacity(&self.config));
+        }
         json!({"generation":self.epoch.load(Ordering::Acquire),"sessions":self.sessions.lock().expect("sessions poisoned").len(),
             "requests":metrics.requests.load(Ordering::Relaxed),"upstream_calls":metrics.upstream_calls.load(Ordering::Relaxed),
             "cache_hits":metrics.cache_hits.load(Ordering::Relaxed),"cache_misses":metrics.cache_misses.load(Ordering::Relaxed),
@@ -1129,7 +1151,7 @@ impl Gateway {
             "buffered_bytes":self.config.limits.buffered_bytes-self.body_bytes.available_permits(),
             "observation_bytes":self.config.limits.observation_bytes-self.observation_bytes.available_permits(),
             "connections":metrics.connections.load(Ordering::Relaxed),"draining":self.draining.load(Ordering::Relaxed),
-            "speculation":self.speculator.stats(),"cleanup":self.cleanup.stats(),"cache":self.cache.stats().unwrap_or(Value::Null)})
+            "speculation":self.speculator.stats(),"cleanup":self.cleanup.stats(),"cache":cache})
     }
 }
 
@@ -1201,4 +1223,69 @@ fn ensure_size(value: &Value) -> Result<()> {
         "message exceeds limit"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn admitted_requests_and_workflow_branches_fit_cache_flights() {
+        for (requests, branches) in [(500, 1), (100, 2)] {
+            let mut config: Config = serde_json::from_value(json!({
+                "admin_token_env":"ADMIN", "users":[], "servers":[],
+                "max_in_flight": requests,
+            }))
+            .unwrap();
+            if branches > 1 {
+                config.workflows.push(config::Workflow {
+                    name: "parallel".into(),
+                    description: "parallel reads".into(),
+                    input_schema: json!({"type":"object"}),
+                    steps: (0..branches)
+                        .map(|i| config::Step {
+                            id: format!("read-{i}"),
+                            tool: "peer__read".into(),
+                            arguments: BTreeMap::new(),
+                        })
+                        .collect(),
+                    outputs: vec![],
+                });
+            }
+            let cache = Gateway::result_cache(&config).unwrap();
+            let permissions = BTreeSet::from(["peer__read".into()]);
+            let key = |i| {
+                Key::new(
+                    Scope {
+                        tenant: "test",
+                        subject: "user",
+                        permissions: &permissions,
+                        generation: 1,
+                        route: "peer",
+                    },
+                    "tools/call",
+                    "read",
+                    &json!({"id":i}),
+                )
+                .unwrap()
+            };
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            // Keep every distinct computation pending, including parallel child
+            // work, so a fast peer cannot hide an undersized singleflight budget.
+            let mut held = Vec::new();
+            for i in 0..requests * branches {
+                held.push(cache.singleflight(&key(i), deadline).await.unwrap());
+            }
+            assert!(cache
+                .singleflight(&key(requests * branches), deadline)
+                .await
+                .is_err());
+            drop(held);
+            assert!(cache
+                .singleflight(&key(requests * branches), deadline)
+                .await
+                .is_ok());
+            assert_eq!(cache.stats().unwrap()["flights"], 0);
+        }
+    }
 }

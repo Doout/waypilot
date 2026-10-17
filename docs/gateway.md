@@ -192,7 +192,7 @@ Defaults under `[limits]`:
 
 Excess requests receive HTTP 503 or a JSON-RPC capacity error; session capacity returns HTTP 429. Admitted calls wait for server/global quotas under their deadline. Cancellation notifications bypass MCP request admission. Admin slots share the outer TCP connection cap.
 
-The HTTP deadline includes body reading and execution. Body reads also have a five-second cap. Stdio execution deadlines start after a complete line. Upstream responses, combined catalogs and retained workflow tool results have 1 MiB caps. Catalogs allow 16 pages and 512 tools. The cache holds 512 entries and 16 MiB of accounted payload, with 128 singleflight keys.
+The HTTP deadline includes body reading and execution. Body reads also have a five-second cap. Stdio execution deadlines start after a complete line. Upstream responses, combined catalogs and retained workflow tool results have 1 MiB caps. Catalogs allow 16 pages and 512 tools. The cache holds 512 entries and 16 MiB of accounted payload. Distinct in-flight computations are bounded by `max_in_flight` times the largest workflow's step count (at least one), capped at 10,000; admin stats report `cache.flight_capacity`. This includes work queued behind upstream quotas and speculative jobs, which share request admission.
 
 Byte budgets exclude decoded JSON, responses and allocator overhead. Readers may hold another `body_readers * request_bytes` before complete-body admission. Set OS/container memory and descriptor limits too.
 
