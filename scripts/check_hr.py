@@ -54,6 +54,99 @@ def observed(sandbox, employee, phase="end"):
 
 
 class HRTests(unittest.TestCase):
+    def test_slow_prediction_starts_with_returned_id_before_agent_demand(self):
+        canonical = "E-009000"
+        with Sandbox(
+            BINARY, delay_ms=1, read_delays={"leave_balance": 1200}, duration_ms=5000
+        ) as sandbox:
+            train(sandbox)
+            sandbox.mutate(alias_id="E-000101", canonical_id=canonical, hold_tool="leave_balance")
+            client = Client(sandbox.base, sandbox.tokens["agent"])
+            try:
+                before = sandbox.peer_stats()["calls"]["leave_balance"]
+                selected = sandbox.stats()["speculation"]["selected"]
+                profile = call(client, "employee")["result"]["structuredContent"]
+                self.assertEqual(profile["employee_id"], canonical)
+                wait_for(lambda: observed(sandbox, canonical, "start"))
+                self.assertFalse(observed(sandbox, canonical, "end"))
+                self.assertEqual(sandbox.stats()["speculation"]["selected"], selected)
+                # The peer has started the read even though no demand for it was sent.
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    pending = pool.submit(call, client, "leave_balance", canonical)
+                    wait_for(lambda: sandbox.stats()["speculation"]["selected"] > selected)
+                    self.assertFalse(pending.done())
+                    sandbox.mutate(hold_tool=None)
+                    result = pending.result(timeout=5)["result"]
+                self.assertEqual(result["structuredContent"]["employee_id"], canonical)
+                self.assertIn(
+                    result["_meta"]["io.waypilot/runtime"]["disposition"], ["joined", "reused"]
+                )
+                self.assertEqual(sandbox.peer_stats()["calls"]["leave_balance"] - before, 1)
+                self.assertEqual(sandbox.peer_stats()["case_count"], 4)
+            finally:
+                sandbox.mutate(hold_tool=None)
+                client.close()
+            asyncio.run(drain(sandbox))
+
+    def test_agent_uses_canonical_result_for_reads_decision_and_write(self):
+        async def run(sandbox):
+            async with connect(sandbox.url, sandbox.tokens["agent"]) as client:
+                return await run_agent(client, "E-000101", think_ms=10)
+
+        with Sandbox(BINARY, delay_ms=1, batch_validation=True) as sandbox:
+            train(sandbox)
+            sandbox.mutate(alias_id="E-000101", canonical_id="E-009000")
+            report = asyncio.run(run(sandbox))
+            self.assertEqual(report["requested_employee_id"], "E-000101")
+            self.assertEqual(report["employee_id"], "E-009000")
+            self.assertEqual(report["decision"], "needs_review")
+            self.assertTrue(
+                all(row["value"]["employee_id"] == "E-009000" for row in report["observations"])
+            )
+            self.assertEqual(
+                sandbox.peer_stats()["cases"][-1],
+                {"employee_id": "E-009000", "kind": "needs_review", "days": 5, "case_id": 5},
+            )
+            asyncio.run(drain(sandbox))
+
+    def test_different_actual_arguments_do_not_reuse_predicted_employee(self):
+        with Sandbox(BINARY, delay_ms=1) as sandbox:
+            train(sandbox)
+            sandbox.mutate(alias_id="E-000101", canonical_id="E-009000")
+            client = Client(sandbox.base, sandbox.tokens["agent"])
+            try:
+                before = sandbox.stats()["speculation"]["unused"]
+                call(client, "employee")
+                wait_for(lambda: observed(sandbox, "E-009000"))
+                result = call(client, "leave_balance", "E-009001")["result"]
+                self.assertEqual(result["structuredContent"]["employee_id"], "E-009001")
+                self.assertEqual(result["structuredContent"]["days"], 8)
+                self.assertEqual(result["_meta"]["io.waypilot/runtime"]["disposition"], "executed")
+                self.assertEqual(sandbox.stats()["speculation"]["unused"], before + 1)
+                self.assertEqual(sandbox.peer_stats()["case_count"], 4)
+            finally:
+                client.close()
+            asyncio.run(drain(sandbox))
+
+    def test_changed_directory_mapping_blocks_write_using_earlier_result(self):
+        with Sandbox(BINARY, delay_ms=1, batch_validation=True) as sandbox:
+            train(sandbox)
+            sandbox.mutate(alias_id="E-000101", canonical_id="E-009000")
+            client = Client(sandbox.base, sandbox.tokens["agent"])
+            try:
+                profile = call(client, "employee", capture=True)["result"]["_meta"][META]["receipt"]
+                wait_for(lambda: observed(sandbox, "E-009000"))
+                balance = call(client, "leave_balance", "E-009000", capture=True)["result"][
+                    "_meta"
+                ][META]["receipt"]
+                sandbox.mutate(alias_id="E-000101", canonical_id="E-009001")
+                reply = call(client, "record_case", "E-009000", require=[profile, balance])
+                self.assertEqual(reply["error"]["code"], -32010)
+                self.assertEqual(sandbox.peer_stats()["case_count"], 4)
+            finally:
+                client.close()
+            asyncio.run(drain(sandbox))
+
     def test_direct_benchmark_bypasses_gateway_with_the_same_agent_plan(self):
         results = []
         for direct in [True, False]:

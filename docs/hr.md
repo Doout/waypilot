@@ -11,6 +11,10 @@ cargo build --locked
 # Use the SDK virtualenv from docs/agents.md.
 target/sdk-venv/bin/python demos/hr_demo.py --think-ms 200 --tool-ms 250
 target/sdk-venv/bin/python demos/hr_demo.py --batch-validation
+# Use the returned canonical ID and a slow next read.
+target/sdk-venv/bin/python demos/hr_demo.py --batch-validation --resolved-id E-009000 \
+  --tool-ms 20 --read-ms leave_balance=3000 --read-ms leave_policy=1000 \
+  --think-ms 1000 --prediction-ms 5000
 # Branch away from the common leave path, or start without learned history.
 target/sdk-venv/bin/python demos/hr_demo.py --kind benefits
 target/sdk-venv/bin/python demos/hr_demo.py --cold
@@ -28,6 +32,13 @@ frequency from successful calls, separately for each principal and policy genera
 The HR configuration requires three observations and 75% confidence before nominating
 one next read. Arguments come from the current call or its result, never a retained
 employee ID. Repeated branch misses lower confidence and stop nomination.
+
+For example, `employee(E-000101)` can return `employee_id = E-009000`. The gateway
+starts `leave_balance(E-009000)` from that returned field while the agent interprets
+the profile. An exact later request can join the running call; it need not wait for
+prefetch to finish. The agent uses the returned ID for its remaining reads and final case.
+Another result can supply the next call's parameters when it becomes available. Current
+speculation stays one read ahead; speculative completions do not launch further reads.
 
 Speculation requires all three: a tool rule with `speculative = true`, state-validated
 reuse, and an explicit user `speculative_tools` grant containing that exact tool name.
@@ -93,6 +104,13 @@ tool RPCs and started/selected/reused/unused/skipped predictions. RPC counts cov
 `tools/call`, including validators; initialization costs remain in wall time and CPU. `reused` counts selected
 nominations followed by a cache hit/join; RPC counts establish the actual upstream work.
 After each mode, sessions, receipts, requests, speculative jobs and cleanup must drain.
+
+`--read-ms READ=MS` sets individual read delays (up to 5,000 ms); `--prediction-ms`
+sets the speculative budget (100–5,000 ms), including preparation and validation, still
+bounded by the original request deadline.
+`tool_waits` reports demanded-call wait percentiles per tool. Test both short and long
+planning pauses: a 3-second read started 1 second before demand can hide about 1 second
+of waiting, with the remaining execution and validation still on the request path.
 
 `speculate_batch` configures the owned peer's `state_batch_tool = "state_batch"`.
 Multiple observations at one validation barrier share a state-batch-v1 RPC, with exact

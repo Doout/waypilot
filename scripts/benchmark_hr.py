@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "demos"))
 from benchmark_agents import percentile
 from hr.runner import run_agent
 from hr.sandbox import Sandbox, connect
+from hr.workbench import read_delay
 
 
 class Direct:
@@ -103,6 +104,8 @@ async def trial(args, mode):
         environment={},
         batch_validation=mode == "speculate_batch",
         state_ms=args.state_ms,
+        read_delays=dict(args.read_ms),
+        duration_ms=args.prediction_ms,
         max_in_flight=max(64, args.concurrency + args.slots + 8),
         timeout_ms=30000,
     ) as sandbox:
@@ -180,6 +183,11 @@ async def trial(args, mode):
             name: count - before["calls"].get(name, 0) for name, count in after["calls"].items()
         }
         canonical = [r["observations"] for r in reports]
+        tool_times = {}
+        for report in reports:
+            for timing in report["timings"]:
+                if timing["phase"] == "tool":
+                    tool_times.setdefault(timing["tool"], []).append(timing["elapsed_ms"])
         return {
             "mode": mode,
             "driver_cpu_seconds": time.process_time() - driver_started,
@@ -214,6 +222,14 @@ async def trial(args, mode):
                 for t in r["timings"]
                 if t["phase"] == "agent_think"
             ),
+            "tool_waits": {
+                name: {
+                    "calls": len(values),
+                    "p50_ms": percentile(values, 0.5),
+                    "p95_ms": percentile(values, 0.95),
+                }
+                for name, values in tool_times.items()
+            },
             "output_digest": hashlib.sha256(
                 json.dumps(canonical, sort_keys=True).encode()
             ).hexdigest(),
@@ -227,6 +243,8 @@ def main():
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--think-ms", type=int, default=200)
     parser.add_argument("--tool-ms", type=int, default=250)
+    parser.add_argument("--read-ms", type=read_delay, action="append", default=[])
+    parser.add_argument("--prediction-ms", type=int, default=2000)
     parser.add_argument("--state-ms", type=int, default=1)
     parser.add_argument("--wrong-every", type=int, default=5)
     parser.add_argument("--slots", type=int, default=8)
@@ -242,8 +260,9 @@ def main():
     if not (
         2 <= args.runs <= 9000
         and 1 <= args.concurrency <= 500
-        and 0 <= args.think_ms <= 2000
-        and 0 <= args.tool_ms <= 1000
+        and 0 <= args.think_ms <= 5000
+        and 0 <= args.tool_ms <= 5000
+        and 100 <= args.prediction_ms <= 5000
         and 0 <= args.state_ms <= 1000
         and 0 <= args.wrong_every <= 1000
         and 1 <= args.slots <= 32

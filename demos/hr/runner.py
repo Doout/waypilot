@@ -52,6 +52,7 @@ async def run_agent(
         )
 
     profile = await call("employee", {"employee_id": employee_id})
+    resolved_id = profile["employee_id"]
     await think("employee")
     if kind == "leave":
         balance = await call("leave_balance", {"employee_id": profile["employee_id"]})
@@ -68,7 +69,7 @@ async def run_agent(
     await think("decision")
     await call(
         "record_case",
-        {"employee_id": employee_id, "kind": decision, "days": days if kind == "leave" else 0},
+        {"employee_id": resolved_id, "kind": decision, "days": days if kind == "leave" else 0},
         write=True,
     )
     canonical = [
@@ -76,7 +77,8 @@ async def run_agent(
         for row in observations
     ]
     return {
-        "employee_id": employee_id,
+        "employee_id": resolved_id,
+        "requested_employee_id": employee_id,
         "kind": kind,
         "decision": decision,
         "observations": canonical,

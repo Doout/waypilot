@@ -16,6 +16,20 @@ from jsonschema.validators import validator_for
 
 STRING = {"type": "string", "minLength": 1, "maxLength": 64}
 READS = ["employee", "leave_balance", "leave_policy", "benefit_options"]
+
+
+def read_delay(value):
+    """CLI override for one synthetic read; writes and validators stay separate."""
+    try:
+        name, milliseconds = value.split("=", 1)
+        milliseconds = int(milliseconds)
+        if name not in READS or not 0 <= milliseconds <= 5000:
+            raise ValueError
+    except ValueError:
+        raise argparse.ArgumentTypeError("expected HR_READ=MS with MS in 0..5000") from None
+    return name, milliseconds
+
+
 TOOLS = [tool(name, "Read synthetic HR " + name, {"employee_id": STRING}) for name in READS]
 TOOLS += [
     tool(
@@ -62,12 +76,14 @@ TOOLS += [
 
 
 class HR:
-    def __init__(self, delay_ms, state_ms=1):
+    def __init__(self, delay_ms, state_ms=1, read_delays=None):
         self.delay_ms = delay_ms
         self.state_ms = state_ms
+        self.read_delays = read_delays or {}
         self.epoch = uuid.uuid4().hex
         self.revisions = Counter()
         self.balances = {}
+        self.aliases = {}
         self.calls = Counter()
         self.cases = []
         self.events = deque(maxlen=20000)
@@ -85,7 +101,8 @@ class HR:
             self.validators[definition["name"]] = implementation(schema)
 
     def read(self, name, args):
-        employee = args["employee_id"]
+        requested = args["employee_id"]
+        employee = self.aliases.get(requested, requested) if name == "employee" else requested
         number = int(employee.removeprefix("E-"))
         region = "EU" if number % 2 == 0 else "US"
         common = {"employee_id": employee, "region": region}
@@ -95,7 +112,7 @@ class HR:
             "leave_policy": dict(common, approval_required=True, max_days=20),
             "benefit_options": dict(common, plans=["standard", "extended"]),
         }
-        return values[name], f"{name}:{employee}"
+        return values[name], f"{name}:{requested}"
 
     async def call(self, name, arguments):
         started = time.monotonic_ns()
@@ -172,7 +189,8 @@ class HR:
                     value = {}
                 if self.hold_tool == name:
                     await self.release.wait()
-                await asyncio.sleep((self.state_ms if checking else self.delay_ms) / 1000)
+                delay = self.state_ms if checking else self.read_delays.get(name, self.delay_ms)
+                await asyncio.sleep(delay / 1000)
             result = {
                 "content": [{"type": "text", "text": json.dumps(value)}],
                 "structuredContent": value,
@@ -209,6 +227,12 @@ class HR:
         return result
 
     def control(self, value):
+        if "alias_id" in value:
+            alias, canonical = value["alias_id"], value["canonical_id"]
+            int(alias.removeprefix("E-"))
+            int(canonical.removeprefix("E-"))
+            self.aliases[alias] = canonical
+            self.revisions["employee:" + alias] += 1
         if "hold_tool" in value:
             self.hold_tool = value["hold_tool"]
             if self.hold_tool:
@@ -232,6 +256,14 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=0)
     parser.add_argument("--delay-ms", type=int, default=250)
     parser.add_argument("--state-ms", type=int, choices=range(0, 1001), default=1)
+    parser.add_argument("--read-ms", type=read_delay, action="append", default=[])
     parser.add_argument("--stdio", action="store_true")
     args = parser.parse_args()
-    asyncio.run(main(args, HR(args.delay_ms, args.state_ms), TOOLS, "waypilot-hr-workbench"))
+    asyncio.run(
+        main(
+            args,
+            HR(args.delay_ms, args.state_ms, dict(args.read_ms)),
+            TOOLS,
+            "waypilot-hr-workbench",
+        )
+    )

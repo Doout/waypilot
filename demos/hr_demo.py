@@ -7,6 +7,7 @@ from pathlib import Path
 
 from hr.runner import run_agent
 from hr.sandbox import Sandbox, connect
+from hr.workbench import read_delay
 
 
 async def run(args, sandbox):
@@ -40,13 +41,21 @@ def main():
     parser.add_argument("--kind", choices=["leave", "benefits"], default="leave")
     parser.add_argument("--think-ms", type=int, default=200)
     parser.add_argument("--tool-ms", type=int, default=250)
+    parser.add_argument("--read-ms", type=read_delay, action="append", default=[])
+    parser.add_argument("--prediction-ms", type=int, default=2000)
+    parser.add_argument(
+        "--resolved-id", help="Synthetic directory maps --employee-id to this canonical ID"
+    )
     parser.add_argument("--state-ms", type=int, default=1)
     parser.add_argument("--batch-validation", action="store_true")
     parser.add_argument("--cold", action="store_true")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     if not (
-        0 <= args.think_ms <= 2000 and 0 <= args.tool_ms <= 1000 and 0 <= args.state_ms <= 1000
+        0 <= args.think_ms <= 5000
+        and 0 <= args.tool_ms <= 5000
+        and 0 <= args.state_ms <= 1000
+        and 100 <= args.prediction_ms <= 5000
     ):
         parser.error("invalid delay")
     with Sandbox(
@@ -55,7 +64,11 @@ def main():
         args.tool_ms,
         state_ms=args.state_ms,
         batch_validation=args.batch_validation,
+        duration_ms=args.prediction_ms,
+        read_delays=dict(args.read_ms),
     ) as sandbox:
+        if args.resolved_id:
+            sandbox.mutate(alias_id=args.employee_id, canonical_id=args.resolved_id)
         result = asyncio.run(run(args, sandbox))
     encoded = json.dumps(result, indent=2) + "\n"
     if args.output:

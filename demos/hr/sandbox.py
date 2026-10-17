@@ -33,6 +33,7 @@ class Sandbox:
         grants=True,
         batch_validation=False,
         state_ms=1,
+        read_delays=None,
         environment=None,
         max_in_flight=64,
     ):
@@ -69,6 +70,11 @@ class Sandbox:
                         str(delay_ms),
                         "--state-ms",
                         str(state_ms),
+                        *[
+                            argument
+                            for name, milliseconds in (read_delays or {}).items()
+                            for argument in ["--read-ms", f"{name}={milliseconds}"]
+                        ],
                     ],
                     env,
                 )
