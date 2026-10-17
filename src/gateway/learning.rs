@@ -19,6 +19,7 @@ struct Binding {
 }
 struct Rule {
     id: String,
+    instance: u64,
     user: String,
     after: String,
     source_revision: String,
@@ -56,6 +57,7 @@ struct State {
     rules: Vec<Rule>,
     decisions: BTreeMap<String, bool>,
     dropped: u64,
+    next_instance: u64,
 }
 pub(super) struct Learner {
     config: Learning,
@@ -100,7 +102,7 @@ pub(super) struct Trial {
     id: String,
     epoch: u64,
     baseline_us: f64,
-    generation: u64,
+    cohort: (u64, u64),
     finished: bool,
     pub cancel: CancellationToken,
 }
@@ -110,7 +112,7 @@ impl Drop for Trial {
             self.learner.feedback(
                 &self.id,
                 self.epoch,
-                self.generation,
+                self.cohort,
                 false,
                 0.0,
                 self.baseline_us,
@@ -124,7 +126,7 @@ impl Trial {
         self.learner.feedback(
             &self.id,
             self.epoch,
-            self.generation,
+            self.cohort,
             reused,
             wait_us,
             self.baseline_us,
@@ -337,6 +339,7 @@ impl Learner {
                 rules: vec![],
                 decisions,
                 dropped: 0,
+                next_instance: 0,
             }),
         }))
     }
@@ -539,8 +542,10 @@ impl Learner {
                         return;
                     }
                 }
+                state.next_instance += 1;
                 let mut rule = Rule {
                     id: String::new(),
+                    instance: state.next_instance,
                     user: user.into(),
                     after: prior.name.clone(),
                     source_revision: prior.revision.clone(),
@@ -631,7 +636,7 @@ impl Learner {
             id: id.into(),
             epoch,
             baseline_us: rule.baseline(),
-            generation: rule.trial_generation,
+            cohort: (rule.instance, rule.trial_generation),
             finished: false,
             cancel: rule.cancel.child_token(),
         })
@@ -640,7 +645,7 @@ impl Learner {
         &self,
         id: &str,
         epoch: u64,
-        generation: u64,
+        cohort: (u64, u64),
         reused: bool,
         wait_us: f64,
         baseline_us: f64,
@@ -652,12 +657,15 @@ impl Learner {
         let Some(rule) = state.rules.iter_mut().find(|r| r.id == id) else {
             return;
         };
+        if cohort.0 != rule.instance {
+            return;
+        }
         if reused {
             rule.reused += 1;
         } else {
             rule.unused += 1;
         }
-        if generation != rule.trial_generation {
+        if cohort.1 != rule.trial_generation {
             return;
         }
         let saved_us = if reused {

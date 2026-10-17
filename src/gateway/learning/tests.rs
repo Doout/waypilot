@@ -281,3 +281,29 @@ fn late_outcomes_from_a_retired_trial_do_not_poison_recovery() {
     assert_eq!(l.report(1)["rules"][0]["prediction_samples"], 0);
     assert_eq!(l.report(1)["rules"][0]["unused"], 4);
 }
+
+#[test]
+fn late_outcomes_from_an_evicted_rule_do_not_poison_rediscovery() {
+    let mut l = learner(LearningMode::Auto);
+    Arc::get_mut(&mut l).unwrap().config.max_rules = 1;
+    for n in 1..=3 {
+        observe(&l, n, "hr__balance", true);
+    }
+    let id = l.report(1)["rules"][0]["id"].as_str().unwrap().to_string();
+    let late = l.start(&id, 1).unwrap();
+    for _ in 0..3 {
+        drop(l.start(&id, 1).unwrap());
+    }
+    observe(&l, 4, "hr__other", true);
+    let replacement = l.report(1)["rules"][0]["id"].as_str().unwrap().to_string();
+    assert_ne!(id, replacement);
+    l.decide(&replacement, false);
+    for n in 5..=7 {
+        observe(&l, n, "hr__balance", true);
+    }
+    assert_eq!(l.report(1)["rules"][0]["id"], id);
+    assert_eq!(l.report(1)["rules"][0]["status"], "active");
+    drop(late);
+    assert_eq!(l.report(1)["rules"][0]["prediction_samples"], 0);
+    assert_eq!(l.report(1)["rules"][0]["unused"], 0);
+}
