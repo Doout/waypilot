@@ -46,6 +46,7 @@ pub struct ResourceLimits {
     pub buffered_bytes: usize,
     pub observation_bytes: usize,
     pub upstream_calls: usize,
+    pub validation_parallelism: usize,
     pub upstream_initializations: usize,
     pub upstream_idle_per_host: usize,
     pub cleanup_pending: usize,
@@ -62,6 +63,7 @@ impl Default for ResourceLimits {
             buffered_bytes: 32 * 1024 * 1024,
             observation_bytes: 16 * 1024 * 1024,
             upstream_calls: 512,
+            validation_parallelism: 1,
             upstream_initializations: 64,
             upstream_idle_per_host: 64,
             cleanup_pending: 4096,
@@ -246,6 +248,7 @@ impl Config {
                 && (1024..=1024 * 1024).contains(&limits.request_bytes)
                 && (limits.request_bytes..=1024 * 1024 * 1024).contains(&limits.buffered_bytes)
                 && (1024..=256 * 1024 * 1024).contains(&limits.observation_bytes)
+                && (1..=8).contains(&limits.validation_parallelism)
                 && (1..=8192).contains(&limits.upstream_calls)
                 && (1..=1024).contains(&limits.upstream_initializations)
                 && (0..=8192).contains(&limits.upstream_idle_per_host)

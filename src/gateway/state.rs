@@ -1,5 +1,6 @@
 //! Waypilot state-v1 adapter. Versions are supplied by an explicitly trusted upstream.
 use super::{Fault, Gateway, Session};
+use futures_util::{stream, StreamExt};
 use rand::Rng;
 use serde_json::Value;
 use std::{
@@ -383,6 +384,50 @@ impl Gateway {
         .await
     }
     pub(crate) async fn validate_states(
+        &self,
+        session: &Arc<Session>,
+        states: &[Arc<RemoteState>],
+        deadline: Instant,
+        epoch: u64,
+    ) -> Result<(), Fault> {
+        let parallelism = self.config.limits.validation_parallelism;
+        if parallelism == 1 || states.len() < 2 {
+            return self
+                .validate_state_group(session, states, deadline, epoch)
+                .await;
+        }
+        // Each logical server retains its existing validation order and session
+        // serialization. Only independent servers overlap; validators are required
+        // to have no effects. A failure drops outstanding validation futures.
+        let mut groups: BTreeMap<&str, Vec<Arc<RemoteState>>> = BTreeMap::new();
+        for state in states {
+            let server = state
+                .validator
+                .split_once("__")
+                .ok_or_else(Fault::invalid)?
+                .0;
+            groups.entry(server).or_default().push(state.clone());
+        }
+        let span = tracing::info_span!(
+            "mcp.state.validate_set",
+            server_groups = groups.len(),
+            parallelism
+        );
+        async {
+            let mut work = stream::iter(groups.into_values().map(|states| async move {
+                self.validate_state_group(session, &states, deadline, epoch)
+                    .await
+            }))
+            .buffer_unordered(parallelism);
+            while let Some(result) = work.next().await {
+                result?;
+            }
+            Ok(())
+        }
+        .instrument(span)
+        .await
+    }
+    async fn validate_state_group(
         &self,
         session: &Arc<Session>,
         states: &[Arc<RemoteState>],

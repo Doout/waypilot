@@ -12,6 +12,12 @@ Base = workbench.Workbench
 
 
 class ValidationWorkbench(Base):
+    def __init__(self, delay_ms):
+        super().__init__(delay_ms)
+        self.validation_arrivals = set()
+        self.validation_ready = asyncio.Event()
+        self.validation_rendezvous = False
+
     mode = "valid"
     block_batch = False
     batch_pending = 0
@@ -19,6 +25,13 @@ class ValidationWorkbench(Base):
     note_pending = 0
 
     def control(self, value):
+        if "validation_rendezvous" in value:
+            if value["validation_rendezvous"] and not self.validation_rendezvous:
+                self.validation_arrivals.clear()
+                self.validation_ready.clear()
+            self.validation_rendezvous = value["validation_rendezvous"]
+            if not self.validation_rendezvous:
+                self.validation_ready.set()
         self.block_note_reply = value.get("block_note_reply", self.block_note_reply)
         self.mode = value.get("batch_mode", self.mode)
         self.block_batch = value.get("block_batch", self.block_batch)
@@ -28,10 +41,24 @@ class ValidationWorkbench(Base):
         return dict(
             super().snapshot(summary),
             batch_pending=self.batch_pending,
+            validation_arrivals=sorted(self.validation_arrivals),
             note_pending=self.note_pending,
         )
 
     async def call(self, name, arguments):
+        if self.validation_rendezvous:
+            target = (
+                "ops"
+                if name == "state_batch"
+                else "knowledge"
+                if name == "state_version" and arguments.get("tool") == "search_runbooks"
+                else None
+            )
+            if target:
+                self.validation_arrivals.add(target)
+                if len(self.validation_arrivals) == 2:
+                    self.validation_ready.set()
+                await self.validation_ready.wait()
         if name != "state_batch":
             result = await super().call(name, arguments)
             if name == "append_note":

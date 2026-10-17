@@ -94,7 +94,7 @@ async fn main() -> Result<()> {
             })?;
             let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
             let result = if command == "list" {
-                json!({"tools":client.catalog(deadline).await?.tools})
+                json!({"tools":client.catalog(deadline).await?.tools.as_ref()})
             } else {
                 client
                     .call(&tool.context("provide --tool")?, arguments, deadline)

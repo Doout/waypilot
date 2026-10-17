@@ -363,6 +363,124 @@ class ValidationTests(unittest.TestCase):
             finally:
                 right.close()
 
+    def test_independent_server_validations_overlap_before_any_effect(self):
+        for parallelism in [1, 4]:
+            with (
+                self.subTest(parallelism=parallelism),
+                patch("agents.sandbox.Process", side_effect=fixture),
+                Sandbox(
+                    BINARY,
+                    batch_validation=True,
+                    validation_parallelism=parallelism,
+                    timeout_ms=2000,
+                ) as sandbox,
+            ):
+                client = Client(sandbox.base, sandbox.tokens["investigator"])
+                token = receipt(call(client, capture=True))
+                sandbox.mutate(validation_rendezvous=True)
+                try:
+                    reply = call(client, "ops__append_note", NOTE, require=[token])
+                    if parallelism == 1:
+                        self.assertEqual(reply["error"]["code"], -32008)
+                        self.assertEqual(sandbox.peer_stats()["note_count"], 0)
+                    else:
+                        self.assertIn("result", reply)
+                        self.assertEqual(
+                            sandbox.peer_stats()["validation_arrivals"], ["knowledge", "ops"]
+                        )
+                        self.assertEqual(sandbox.peer_stats()["note_count"], 1)
+                finally:
+                    sandbox.mutate(validation_rendezvous=False)
+                    client.close()
+
+    def test_parallel_validation_preserves_all_failure_boundaries(self):
+        original = Sandbox
+
+        def parallel(*args, **kwargs):
+            kwargs["validation_parallelism"] = 4
+            return original(*args, **kwargs)
+
+        with patch(__name__ + ".Sandbox", side_effect=parallel):
+            self.test_bad_batch_replies_fail_closed_without_fallback()
+            self.test_blocked_batch_honors_deadline_revocation_and_cancellation()
+            self.test_changed_graph_observation_blocks_later_effect_even_with_same_value()
+            self.test_post_effect_conflict_reports_uncertainty_without_replay()
+            self.test_batch_requires_grants_and_charges_each_observation()
+
+    def test_compiled_client_schemas_track_schema_changes_and_reject_bad_batches(self):
+        import check_agents
+        from agents.runner import compiled_input_schema, validate_input
+        from check_agents import GuardTests
+        from jsonschema import ValidationError
+
+        compiled_input_schema.cache_clear()
+        schema = {
+            "type": "object",
+            "properties": {"value": {"type": "integer"}},
+            "required": ["value"],
+        }
+        validate_input({"value": 1}, schema, True)
+        with self.assertRaises(ValidationError):
+            validate_input({"value": "invalid"}, schema, True)
+        schema["properties"]["value"]["type"] = "string"
+        with self.assertRaises(ValidationError):
+            validate_input({"value": 1}, schema, True)
+        referenced = {"$defs": {"value": {"type": "integer"}}, "$ref": "#/$defs/value"}
+        with patch(
+            "agents.runner.compiled_input_schema",
+            side_effect=AssertionError("reference was cached"),
+        ):
+            validate_input(1, referenced, True)
+            validate_input(1, {"type": "integer", "description": "x" * 17000}, True)
+            with self.assertRaises(ValidationError):
+                validate_input("wrong", referenced, True)
+        original = check_agents.run_agent
+
+        async def cached(*args, **kwargs):
+            return await original(*args, **kwargs, compiled_input_schemas=True)
+
+        with patch("check_agents.run_agent", side_effect=cached):
+            GuardTests(
+                "test_whole_batch_validated_before_dispatch"
+            ).test_whole_batch_validated_before_dispatch()
+
+    def test_persistent_clients_rotate_before_receipt_capacity(self):
+        from benchmark_agents import measure
+
+        with Sandbox(BINARY, batch_validation=True, validation_parallelism=4) as sandbox:
+            result = asyncio.run(
+                measure(
+                    sandbox,
+                    26,
+                    1,
+                    guard_observations=True,
+                    compiled_input_schemas=True,
+                    reuse_sessions=True,
+                )
+            )
+            self.assertEqual(result["mcp_sessions_started"], 3)
+            self.assertEqual(result["effect_calls"], 26)
+            self.assertEqual(sandbox.stats()["sessions"], 0)
+            self.assertEqual(sandbox.stats()["observation_bytes"], 0)
+
+    def test_compiled_peer_schemas_preserve_validation_and_effects(self):
+        from agents.workbench import Workbench
+
+        for compiled in ["0", "1"]:
+            with patch.dict("os.environ", {"WORKBENCH_COMPILED_SCHEMAS": compiled}):
+                peer = Workbench(delay_ms=0)
+            for tool, args in [
+                ("append_note", {}),
+                ("append_note", dict(NOTE, extra=True)),
+                ("get_metrics", {"service": None}),
+                ("state_batch", {"version": 1, "observations": []}),
+            ]:
+                self.assertTrue(asyncio.run(peer.call(tool, args))["isError"])
+            self.assertEqual(peer.notes, [])
+            result = asyncio.run(peer.call("append_note", NOTE))
+            self.assertFalse(result["isError"])
+            self.assertEqual(len(peer.notes), 1)
+
     def test_guarded_sdk_agents_http_stdio_and_concurrent(self):
         async def run(sandbox, transport="http"):
             async with connect(

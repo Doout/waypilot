@@ -35,6 +35,10 @@ jobs:
           python3 demos/agent_demo.py target/release/waypilot --output target/agent-demo.json
           python3 scripts/benchmark_agents.py target/release/waypilot --runs 20 --output target/agent-benchmark.json
           python3 scripts/benchmark_validation.py target/release/waypilot --runs 20 --concurrency 4 --rounds 1 --output target/validation-benchmark.json
+          python3 scripts/benchmark_latency.py target/release/waypilot --baseline target/release/waypilot \
+            --runs 20 --concurrency 4 --rounds 1 --profile baseline --profile parallel \
+            --profile parallel_compiled --profile pooled_parallel --profile pooled_uncached \
+            --output target/latency-benchmark.json
       - name: State validation benchmark controls
         run: |
           export WAYPILOT_PYTHON="$(command -v python3)"
@@ -51,7 +55,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           python3 load/observation_qualify.py target/release/waypilot \
-            --clients 1000 --concurrency 500 --output target/observation-scale.json
+            --clients 1000 --concurrency 500 --validation-parallelism 4 --output target/observation-scale.json
       - name: Qualify 1,000 clients and 500 concurrent calls
         if: runner.os == 'Linux'
         run: |
@@ -74,6 +78,7 @@ jobs:
             target/agent-demo.json
             target/agent-benchmark.json
             target/validation-benchmark.json
+            target/latency-benchmark.json
             target/observation-scale-smoke.json
             target/observation-scale.json
             target/agent-soak-smoke/*.json

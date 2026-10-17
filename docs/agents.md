@@ -16,7 +16,7 @@ python3 -m venv target/sdk-venv
 target/sdk-venv/bin/python -m pip install -r requirements-dev.txt
 bash scripts/agent_demo.sh --output target/agents/demo.json
 bash scripts/agent_demo.sh --incident INC-202 --transport stdio
-bash scripts/agent_demo.sh --batch-validation --guard-observations
+bash scripts/agent_demo.sh --batch-validation --guard-observations --validation-parallelism 4
 ```
 
 `--batch-validation` uses the workbench's cooperative batch validator.
@@ -92,24 +92,14 @@ total upstream calls. Model calls are zero. This measures the local tool workloa
 not LLM latency or arbitrary remote-server performance. The 32-agent workload is
 separate from the existing [1,000-client gateway qualification](testing.md#load-test).
 
-Release measurements on 2026-10-17, macOS ARM64, Python 3.14.7: 128 agents,
-concurrency 32, 30 ms business tools and 1 ms validators. Two rounds reverse mode order;
-these p95 ranges include cold starts. The previous binary is from `8694aaf`.
+The workbench now compiles its fixed JSON schemas once. The runner caches compilation
+of up to 128 self-contained schemas, each at most 16 KiB; schemas containing references
+use the original validation path. Every argument is still checked before dispatch.
+`--legacy-schemas` restores per-call schema-definition checks for baseline comparisons.
+Compilation retains no tool results or authorization decisions.
 
-| Mode | p95 ms, two rounds | Validation RPCs / observations checked |
-| --- | ---: | ---: |
-| Previous binary, single | 816–904 | 1,792 / 1,792 |
-| Uncached | 535–547 | 0 / 0 |
-| Current single | 825–853 | 1,792 / 1,792 |
-| Batch | 804–816 | 1,536 / 1,792 |
-| Guarded single | 1279–1284 | 3,072 / 3,072 |
-| Guarded batch | 1170–1223 | 2,048 / 3,072 |
-
-Every mode returned matching business observations and decisions, with 128 notes.
-Uncached mode made 896 business calls; each reused mode made 12. Batching kept all
-checks and reduced validation RPCs by 14% without guards and 33% with guards. Guarded
-batching reduced p95 by 5–9% against guarded single validation in these runs. All reuse
-variants were slower than uncached at this concurrency; this is not a universal speedup.
+See [latency experiments](latency.md) for the measured effects of schema compilation,
+parallel validation, admission limits and MCP session reuse, including rejected methods.
 
 Reports include discovery, planning and per-tool elapsed times and gateway dispositions.
 Set the existing [OTLP environment variables](gateway.md#tracing) to export gateway
@@ -166,7 +156,7 @@ business observations and exact effect counts:
 ```sh
 target/sdk-venv/bin/python scripts/benchmark_validation.py target/release/waypilot \
   --baseline-binary /path/to/previous/waypilot --runs 128 --concurrency 32 \
-  --output target/validation-benchmark.json
+  --legacy-schemas --output target/validation-benchmark.json
 ```
 
 The runner alternates mode order across two rounds and checks that single and batch

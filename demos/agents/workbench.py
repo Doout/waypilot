@@ -13,6 +13,7 @@ from copy import deepcopy
 
 import uvicorn
 from jsonschema import ValidationError, validate
+from jsonschema.validators import validator_for
 from mcp import types
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
@@ -132,6 +133,14 @@ STATEFUL = {"get_incident", "get_metrics", "get_deployment", "search_runbooks", 
 class Workbench:
     def __init__(self, delay_ms=30):
         self.delay_ms = delay_ms
+        self.validators = None
+        if os.environ.get("WORKBENCH_COMPILED_SCHEMAS", "1") == "1":
+            self.validators = {}
+            for name, definition in CATALOG.items():
+                schema = definition["inputSchema"]
+                implementation = validator_for(schema)
+                implementation.check_schema(schema)
+                self.validators[name] = implementation(schema)
         self.epoch = uuid.uuid4().hex
         self.revisions = Counter()
         self.metrics = {
@@ -187,13 +196,19 @@ class Workbench:
             return RUNBOOKS[arguments["id"]], "runbooks"
         raise ValueError("tool has no state contract")
 
+    def validate(self, name, arguments):
+        if self.validators is None:
+            validate(arguments, CATALOG[name]["inputSchema"])
+        else:
+            self.validators[name].validate(arguments)
+
     async def call(self, name, arguments):
         started = time.monotonic_ns()
         self.calls[name] += 1
         self.active += 1
         self.peak = max(self.peak, self.active)
         try:
-            validate(arguments, CATALOG[name]["inputSchema"])
+            self.validate(name, arguments)
             if name in self.fail_next:
                 self.fail_next.remove(name)
                 raise ValueError("injected workbench failure")
@@ -206,7 +221,7 @@ class Workbench:
                     read_name, query = observation["tool"], observation["arguments"]
                     if read_name not in STATEFUL:
                         raise ValueError("unsupported batch target")
-                    validate(query, CATALOG[read_name]["inputSchema"])
+                    self.validate(read_name, query)
                     _, resource = self.read(read_name, query)
                     batch.append(
                         {
@@ -223,7 +238,7 @@ class Workbench:
                 query = arguments["arguments"] if checking else arguments
                 if read_name not in STATEFUL:
                     raise ValueError("unsupported state validator target")
-                validate(query, CATALOG[read_name]["inputSchema"])
+                self.validate(read_name, query)
                 # Capture value and its evidence without yielding; mutation is on this event loop.
                 value, resource = self.read(read_name, query)
                 value = {} if checking else deepcopy(value)

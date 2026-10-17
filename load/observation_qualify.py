@@ -29,6 +29,10 @@ async def run(args):
         max_in_flight=args.concurrency,
         timeout_ms=30000,
         upstream_calls=args.upstream_calls,
+        validation_parallelism=args.validation_parallelism
+        if args.validation_parallelism > 1
+        else None,
+        compiled_schemas=not args.legacy_schemas,
         environment={},
     ) as sandbox:
         port = int(sandbox.base.rsplit(":", 1)[1])
@@ -217,6 +221,8 @@ async def run(args):
             "status": "passed",
             "clients": args.clients,
             "upstream_calls_budget": args.upstream_calls,
+            "compiled_schemas": not args.legacy_schemas,
+            "validation_parallelism": args.validation_parallelism,
             "max_pending_calls": peak_pending,
             "phases": phases,
             "exact_notes": len(notes),
@@ -234,6 +240,8 @@ if __name__ == "__main__":
     parser.add_argument("--clients", type=int, default=1000)
     parser.add_argument("--concurrency", type=int, default=500)
     parser.add_argument("--upstream-calls", type=int, default=64)
+    parser.add_argument("--legacy-schemas", action="store_true")
+    parser.add_argument("--validation-parallelism", type=int, choices=range(1, 9), default=1)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if not 1 <= args.concurrency <= min(args.clients, 500) or not 1 <= args.clients <= 2000:

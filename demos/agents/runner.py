@@ -8,8 +8,10 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from functools import lru_cache
 
 from jsonschema import ValidationError, validate
+from jsonschema.validators import validator_for
 
 # Authored read contract for the owned workbench; annotations do not extend it.
 OWNED_READS = {
@@ -21,6 +23,34 @@ OWNED_READS = {
     "knowledge__assess",
     "waypilot__triage",
 }
+
+
+@lru_cache(maxsize=128)
+def compiled_input_schema(encoded):
+    schema = json.loads(encoded)
+    implementation = validator_for(schema)
+    implementation.check_schema(schema)
+    return implementation(schema)
+
+
+def validate_input(arguments, schema, compiled=False):
+    if compiled:
+        encoded = json.dumps(schema, sort_keys=True, separators=(",", ":"))
+        pending = [schema]
+        references = False
+        while pending:
+            value = pending.pop()
+            if isinstance(value, dict):
+                references |= any(key in value for key in ("$ref", "$dynamicRef", "$recursiveRef"))
+                pending.extend(value.values())
+            elif isinstance(value, list):
+                pending.extend(value)
+        # Cache compilation only. Mutable external references retain the original
+        # validation path; arguments, results and permissions are never retained.
+        if len(encoded) <= 16384 and not references:
+            compiled_input_schema(encoded).validate(arguments)
+            return
+    validate(arguments, schema)
 
 
 @dataclass
@@ -208,6 +238,7 @@ async def run_agent(
     capture=False,
     owned_tools=False,
     guard_observations=False,
+    compiled_input_schemas=True,
 ):
     started = time.perf_counter_ns()
     observations, timings = [], []
@@ -307,7 +338,11 @@ async def run_agent(
                 if action.name not in visible:
                     raise ValueError("agent selected an unavailable tool")
                 try:
-                    validate(action.arguments, visible[action.name]["inputSchema"])
+                    validate_input(
+                        action.arguments,
+                        visible[action.name]["inputSchema"],
+                        compiled_input_schemas,
+                    )
                 except ValidationError:
                     raise ValueError("agent supplied invalid tool arguments") from None
             calls += len(decision)

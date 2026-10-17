@@ -6,8 +6,8 @@ cargo fmt --all -- --check
 cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
 "$WAYPILOT_PYTHON" -m py_compile fixtures/*.py demos/*.py demos/agents/*.py scripts/*.py load/*.py
-"${WAYPILOT_SDK_PYTHON:-$WAYPILOT_PYTHON}" -m ruff check load demos/agents demos/agent_demo.py fixtures/agent_barrier.py fixtures/agent_validation.py scripts/check_agents.py scripts/check_validation.py scripts/benchmark_agents.py scripts/benchmark_validation.py
-"${WAYPILOT_SDK_PYTHON:-$WAYPILOT_PYTHON}" -m ruff format --check --quiet load demos/agents demos/agent_demo.py fixtures/agent_barrier.py fixtures/agent_validation.py scripts/check_agents.py scripts/check_validation.py scripts/benchmark_agents.py scripts/benchmark_validation.py
+"${WAYPILOT_SDK_PYTHON:-$WAYPILOT_PYTHON}" -m ruff check load demos/agents demos/agent_demo.py fixtures/agent_barrier.py fixtures/agent_validation.py scripts/check_agents.py scripts/check_validation.py scripts/benchmark_agents.py scripts/benchmark_validation.py scripts/benchmark_latency.py
+"${WAYPILOT_SDK_PYTHON:-$WAYPILOT_PYTHON}" -m ruff format --check --quiet load demos/agents demos/agent_demo.py fixtures/agent_barrier.py fixtures/agent_validation.py scripts/check_agents.py scripts/check_validation.py scripts/benchmark_agents.py scripts/benchmark_validation.py scripts/benchmark_latency.py
 cargo build --locked
 "$WAYPILOT_PYTHON" scripts/check_gateway.py target/debug/waypilot
 "$WAYPILOT_PYTHON" scripts/check_state.py target/debug/waypilot
@@ -22,4 +22,4 @@ cargo build --locked
 
 "$WAYPILOT_PYTHON" load/state_qualify.py target/debug/waypilot --clients 64 --concurrency 32 --output target/state-scale-smoke.json
 
-"${WAYPILOT_SDK_PYTHON:-$WAYPILOT_PYTHON}" load/observation_qualify.py target/debug/waypilot --clients 64 --concurrency 32 --output target/observation-scale-smoke.json
+"${WAYPILOT_SDK_PYTHON:-$WAYPILOT_PYTHON}" load/observation_qualify.py target/debug/waypilot --clients 64 --concurrency 32 --validation-parallelism 4 --output target/observation-scale-smoke.json

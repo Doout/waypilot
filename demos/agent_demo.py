@@ -48,6 +48,7 @@ async def run(args, sandbox=None):
                     timeout=args.timeout,
                     owned_tools=sandbox is not None,
                     guard_observations=args.guard_observations,
+                    compiled_input_schemas=not args.legacy_schemas,
                 )
                 report["iteration"] = index + 1
                 reports.append(report)
@@ -82,6 +83,12 @@ def arguments():
     parser.add_argument("--transport", choices=["http", "stdio"], default="http")
     parser.add_argument("--no-reuse", action="store_true")
     parser.add_argument("--batch-validation", action="store_true")
+    parser.add_argument("--validation-parallelism", type=int, choices=range(1, 9), default=1)
+    parser.add_argument(
+        "--legacy-schemas",
+        action="store_true",
+        help="Recheck schemas on each call for baseline comparisons",
+    )
     parser.add_argument("--guard-observations", action="store_true")
     parser.add_argument("--timeout", type=float, default=120)
     parser.add_argument("--model", help="Explicit model ID; required in model mode")
@@ -121,6 +128,10 @@ def main():
             reuse=not args.no_reuse,
             start_http=args.transport == "http",
             batch_validation=args.batch_validation,
+            validation_parallelism=args.validation_parallelism
+            if args.validation_parallelism > 1
+            else None,
+            compiled_schemas=not args.legacy_schemas,
         ) as sandbox:
             result = asyncio.run(run(args, sandbox))
     encoded = json.dumps(result, indent=2)

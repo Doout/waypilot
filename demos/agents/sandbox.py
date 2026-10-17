@@ -50,6 +50,8 @@ class Sandbox:
         max_sessions=128,
         max_in_flight=64,
         upstream_calls=512,
+        validation_parallelism=None,
+        compiled_schemas=True,
         delay_ms=30,
         timeout_ms=10000,
         start_http=True,
@@ -74,6 +76,7 @@ class Sandbox:
         self.env.update(
             {
                 "RUST_LOG": "error",
+                "WORKBENCH_COMPILED_SCHEMAS": "1" if compiled_schemas else "0",
                 "WORKBENCH_CONTROL_TOKEN": self.tokens["control"],
                 "AGENT_INVESTIGATOR": self.tokens["investigator"],
                 "AGENT_REVIEWER": self.tokens["reviewer"],
@@ -105,6 +108,8 @@ request_timeout_ms = {timeout_ms}
 [limits]
 upstream_calls = {upstream_calls}
 """
+            if validation_parallelism is not None:
+                text += f"validation_parallelism = {validation_parallelism}\n"
             reads = [
                 "ops__get_incident",
                 "ops__get_metrics",

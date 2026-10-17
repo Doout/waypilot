@@ -163,6 +163,11 @@ async def measure(args, label, reuse, collector, progress_path):
         delay_ms=args.delay_ms,
         environment=environment,
         batch_validation=reuse and args.batch_validation,
+        compiled_schemas=not args.legacy_schemas,
+        validation_parallelism=args.validation_parallelism
+        if args.validation_parallelism > 1
+        else None,
+        upstream_calls=args.upstream_calls,
     ) as sandbox:
         gateway = psutil.Process(sandbox.service.process.pid)
         peer_process = psutil.Process(sandbox.peer_process.process.pid)
@@ -237,6 +242,7 @@ async def measure(args, label, reuse, collector, progress_path):
                                     role=role,
                                     capture=True,
                                     owned_tools=True,
+                                    compiled_input_schemas=not args.legacy_schemas,
                                     timeout=30,
                                     guard_observations=reuse and args.guard_observations,
                                 )
@@ -488,6 +494,9 @@ async def main(args):
             "trace_ratio": args.trace_ratio,
             "model_calls": 0,
             "batch_validation": args.batch_validation,
+            "compiled_schemas": not args.legacy_schemas,
+            "validation_parallelism": args.validation_parallelism,
+            "upstream_calls": args.upstream_calls,
             "guard_observations": args.guard_observations,
             "mutations": "barrier-separated value changes and same-value revisions; separate failure/race qualification required",
             "comparison": "all structured business observations, excluding runtime metadata, graph timings and generated note IDs",
@@ -529,6 +538,9 @@ if __name__ == "__main__":
     parser.add_argument("--trace-ratio", type=float, default=0.01)
     parser.add_argument("--max-rss-mb", type=int, default=512)
     parser.add_argument("--batch-validation", action="store_true")
+    parser.add_argument("--legacy-schemas", action="store_true")
+    parser.add_argument("--validation-parallelism", type=int, choices=range(1, 9), default=1)
+    parser.add_argument("--upstream-calls", type=int, choices=range(1, 513), default=512)
     parser.add_argument("--guard-observations", action="store_true")
     parser.add_argument("--revision", default="working-tree")
     parser.add_argument("--output-dir", type=Path, default=Path("target/agent-soak"))

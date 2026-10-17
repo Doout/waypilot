@@ -20,6 +20,7 @@ def main():
     parser.add_argument("--delay-ms", type=int, default=30)
     parser.add_argument("--rounds", type=int, default=2)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--legacy-schemas", action="store_true")
     args = parser.parse_args()
     if not (
         2 <= args.runs <= 9000
@@ -44,7 +45,12 @@ def main():
         for label, reuse, batch, guarded in modes if iteration % 2 == 0 else reversed(modes):
             binary = str(args.baseline_binary) if label == "previous_single" else args.binary
             with Sandbox(
-                binary, reuse=reuse, batch_validation=batch, delay_ms=args.delay_ms, environment={}
+                binary,
+                reuse=reuse,
+                batch_validation=batch,
+                delay_ms=args.delay_ms,
+                environment={},
+                compiled_schemas=not args.legacy_schemas,
             ) as sandbox:
                 gateway, peer = (
                     psutil.Process(sandbox.service.process.pid),
@@ -52,7 +58,13 @@ def main():
                 )
                 before, peer_before = gateway.cpu_times(), peer.cpu_times()
                 result = asyncio.run(
-                    measure(sandbox, args.runs, args.concurrency, guard_observations=guarded)
+                    measure(
+                        sandbox,
+                        args.runs,
+                        args.concurrency,
+                        guard_observations=guarded,
+                        compiled_input_schemas=not args.legacy_schemas,
+                    )
                 )
                 after, peer_after = gateway.cpu_times(), peer.cpu_times()
                 result.update(
@@ -102,6 +114,7 @@ def main():
         else None,
         "platform": platform.platform(),
         "model_calls": 0,
+        "compiled_schemas": not args.legacy_schemas,
         "limits": [
             "Owned loopback tools with 1 ms validators; no arbitrary remote performance claim",
             "Guarded modes perform additional validation before and after the note call",

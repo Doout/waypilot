@@ -132,6 +132,12 @@ admission and the original deadline. `mcp.state.validate_batch` exposes duration
 arguments and versions stay out of traces. Servers without the batch contract keep using
 individual RPCs.
 
+Set `limits.validation_parallelism = 4` to overlap validation across independent
+configured servers (range 1–8; default 1). Each server keeps its existing call order.
+Validation points, rate charges, fresh grants and the original deadline remain unchanged.
+Failure cancels unfinished groups, though an authorized validation RPC may already have
+reached its peer. `mcp.state.validate_set` records the group count and duration.
+
 ### Observations across MCP calls
 
 A client can request `params._meta["io.waypilot/observations"] = {"capture":true}` on a

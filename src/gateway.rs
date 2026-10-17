@@ -832,7 +832,8 @@ impl Gateway {
                     code: -32002,
                     message: "upstream tool discovery failed",
                 })?;
-            for mut tool in catalog {
+            for definition in catalog.iter() {
+                let mut tool = definition.clone();
                 let name = format!(
                     "{}__{}",
                     server,

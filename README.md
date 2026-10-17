@@ -7,7 +7,7 @@ receipts to check earlier reads before a later call.
 
 The [incident-agent workbench](docs/agents.md) runs an investigator and read-only reviewer
 through real MCP tools, with a free policy mode, optional model mode and an uncached
-benchmark baseline. Start it with `bash scripts/agent_demo.sh` after installing the test dependencies.
+benchmark baseline. [Latency experiments](docs/latency.md) compare several optimization methods. Start it with `bash scripts/agent_demo.sh` after installing the test dependencies.
 
 This is a single-node pre-release. Workflows come from TOML. Prewarming prepares servers without invoking tools.
 

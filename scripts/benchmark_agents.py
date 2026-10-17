@@ -20,21 +20,43 @@ def percentile(values, fraction):
     return sorted(values)[max(0, math.ceil(len(values) * fraction) - 1)]
 
 
-async def measure(sandbox, runs, concurrency, *, guard_observations=False):
+async def measure(
+    sandbox,
+    runs,
+    concurrency,
+    *,
+    guard_observations=False,
+    compiled_input_schemas=False,
+    reuse_sessions=False,
+):
     semaphore = asyncio.Semaphore(concurrency)
+    queued_ms, lifetime_ms = [], []
+    sessions_started = 0
+    submitted = time.perf_counter_ns()
 
-    async def one(index):
+    async def invoke(client, incident):
+        return await run_agent(
+            client,
+            Policy(incident, "investigator"),
+            role="investigator",
+            owned_tools=True,
+            capture=True,
+            guard_observations=guard_observations,
+            compiled_input_schemas=compiled_input_schemas,
+        )
+
+    async def one(index, persistent=None):
+        nonlocal sessions_started
         async with semaphore:
+            queued_ms.append((time.perf_counter_ns() - submitted) / 1e6)
             incident = "INC-101" if index % 2 == 0 else "INC-202"
-            async with connect(sandbox.url, sandbox.tokens["investigator"]) as client:
-                report = await run_agent(
-                    client,
-                    Policy(incident, "investigator"),
-                    role="investigator",
-                    owned_tools=True,
-                    capture=True,
-                    guard_observations=guard_observations,
-                )
+            if persistent is None:
+                sessions_started += 1
+                async with connect(sandbox.url, sandbox.tokens["investigator"]) as client:
+                    report = await invoke(client, incident)
+            else:
+                report = await invoke(persistent, incident)
+            lifetime_ms.append((time.perf_counter_ns() - submitted) / 1e6)
             expected = "restore_pool_limit" if incident == "INC-101" else "scale_workers"
             if expected not in report["summary"]:
                 raise RuntimeError("incorrect incident decision")
@@ -55,7 +77,27 @@ async def measure(sandbox, runs, concurrency, *, guard_observations=False):
             return report
 
     started = time.perf_counter()
-    reports = await asyncio.gather(*(one(index) for index in range(runs)))
+    if reuse_sessions:
+        # Owned workbench contract only. A worker owns its SDK context and never
+        # shares a client between concurrent agents. Rotate before receipt limits.
+        reports = [None] * runs
+
+        async def worker(slot):
+            nonlocal sessions_started
+            indices = iter(range(slot, runs, concurrency))
+            while (first := next(indices, None)) is not None:
+                sessions_started += 1
+                async with connect(sandbox.url, sandbox.tokens["investigator"]) as client:
+                    reports[first] = await one(first, client)
+                    for _ in range(11):
+                        index = next(indices, None)
+                        if index is None:
+                            break
+                        reports[index] = await one(index, client)
+
+        await asyncio.gather(*(worker(slot) for slot in range(min(runs, concurrency))))
+    else:
+        reports = await asyncio.gather(*(one(index) for index in range(runs)))
     elapsed = time.perf_counter() - started
     durations = [report["elapsed_ms"] for report in reports]
     calls = sandbox.peer_stats()["calls"]
@@ -66,9 +108,13 @@ async def measure(sandbox, runs, concurrency, *, guard_observations=False):
         "p95_ms": percentile(durations, 0.95),
         "p99_ms": percentile(durations, 0.99),
         "wall_seconds": elapsed,
+        "queue_p95_ms": percentile(queued_ms, 0.95),
+        "batch_completion_p50_ms": percentile(lifetime_ms, 0.5),
+        "batch_completion_p95_ms": percentile(lifetime_ms, 0.95),
         "completed_agents_per_second": runs / elapsed,
         "agent_tool_calls": sum(report["tool_calls"] for report in reports),
         "model_calls": 0,
+        "mcp_sessions_started": sessions_started,
         "business_calls": sum(
             count
             for tool, count in calls.items()
@@ -99,6 +145,7 @@ def main():
     parser.add_argument("--concurrency", type=int, default=1)
     parser.add_argument("--delay-ms", type=int, default=30)
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--legacy-schemas", action="store_true")
     parser.add_argument(
         "--reuse-first", action="store_true", help="Reverse the mode order for a second measurement"
     )
@@ -114,8 +161,20 @@ def main():
     if args.reuse_first:
         modes.reverse()
     for label, reuse in modes:
-        with Sandbox(args.binary, reuse=reuse, delay_ms=args.delay_ms) as sandbox:
-            results[label] = asyncio.run(measure(sandbox, args.runs, args.concurrency))
+        with Sandbox(
+            args.binary,
+            reuse=reuse,
+            delay_ms=args.delay_ms,
+            compiled_schemas=not args.legacy_schemas,
+        ) as sandbox:
+            results[label] = asyncio.run(
+                measure(
+                    sandbox,
+                    args.runs,
+                    args.concurrency,
+                    compiled_input_schemas=not args.legacy_schemas,
+                )
+            )
     if results["uncached"].pop("summaries") != results["validated_reuse"].pop("summaries"):
         raise RuntimeError("baseline and candidate agent decisions differ")
     if results["uncached"].pop("evidence_digests") != results["validated_reuse"].pop(
