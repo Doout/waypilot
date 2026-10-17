@@ -138,6 +138,10 @@ Validation points, rate charges, fresh grants and the original deadline remain u
 Failure cancels unfinished groups, though an authorized validation RPC may already have
 reached its peer. `mcp.state.validate_set` records the group count and duration.
 
+See [HR lookahead](hr.md) for opt-in, learned next-read speculation with explicit
+read/disclosure contracts and separate work budgets. Initialization prewarming continues
+to invoke no tools.
+
 ### Observations across MCP calls
 
 A client can request `params._meta["io.waypilot/observations"] = {"capture":true}` on a

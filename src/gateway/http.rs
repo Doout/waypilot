@@ -342,7 +342,7 @@ async fn admin_users(State(gateway): State<Arc<Gateway>>, headers: HeaderMap) ->
     if !admin_authorized(&gateway, &headers) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    Json(json!({"users":gateway.actors.iter().map(|actor| json!({"id":actor.settings.id,"tenant":actor.settings.tenant,"enabled":actor.enabled.load(Ordering::Acquire),"tools":actor.settings.tools,"requests_per_second":actor.settings.requests_per_second,"burst":actor.settings.burst})).collect::<Vec<_>>()})).into_response()
+    Json(json!({"users":gateway.actors.iter().map(|actor| json!({"id":actor.settings.id,"tenant":actor.settings.tenant,"enabled":actor.enabled.load(Ordering::Acquire),"tools":actor.settings.tools,"speculative_tools":actor.settings.speculative_tools,"requests_per_second":actor.settings.requests_per_second,"burst":actor.settings.burst})).collect::<Vec<_>>()})).into_response()
 }
 async fn admin_update(
     State(gateway): State<Arc<Gateway>>,

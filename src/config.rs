@@ -33,6 +33,8 @@ pub struct Config {
     pub servers: Vec<Server>,
     #[serde(default)]
     pub workflows: Vec<Workflow>,
+    #[serde(default)]
+    pub speculation: Option<Speculation>,
 }
 /// Independent resource budgets; request admission is not a memory or socket bound.
 #[derive(Clone, Deserialize, Serialize)]
@@ -107,6 +109,8 @@ pub struct User {
     pub tenant: String,
     pub token_env: String,
     pub tools: BTreeSet<String>,
+    #[serde(default)]
+    pub speculative_tools: BTreeSet<String>,
     #[serde(default = "enabled")]
     pub enabled: bool,
     #[serde(default = "rate")]
@@ -137,12 +141,40 @@ pub struct ToolRule {
     pub cache_ttl_ms: u64,
     #[serde(default)]
     pub reusable: bool,
+    /// Operator asserts effect-free, session-independent reads and permits early disclosure.
+    #[serde(default)]
+    pub speculative: bool,
     /// Opt-in state contract; validator is called with the original tool name and arguments.
     #[serde(default)]
     pub state_tool: Option<String>,
     /// Optional state-batch-v1 validator; each observation still consumes rate budget.
     #[serde(default)]
     pub state_batch_tool: Option<String>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Speculation {
+    pub max_in_flight: usize,
+    pub min_samples: u64,
+    pub confidence_percent: u64,
+    pub max_duration_ms: u64,
+    pub rules: Vec<PredictionRule>,
+}
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PredictionRule {
+    pub after: String,
+    pub tool: String,
+    pub arguments: BTreeMap<String, PredictionBinding>,
+}
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PredictionBinding {
+    #[serde(default)]
+    pub input: Option<String>,
+    #[serde(default)]
+    pub result: Option<String>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -341,6 +373,11 @@ impl Config {
                         "state validation requires an explicit reusable tool and a distinct validator");
                 }
                 ensure!(
+                    !rule.speculative
+                        || (rule.reusable && rule.cache_ttl_ms > 0 && rule.state_tool.is_some()),
+                    "speculation requires state-validated reuse"
+                );
+                ensure!(
                     !tool.is_empty()
                         && tool.len() <= 128
                         && rule.cache_ttl_ms <= 3_600_000
@@ -348,6 +385,62 @@ impl Config {
                     "result reuse requires explicit reusable=true and bounded TTL"
                 );
             }
+        }
+        if let Some(speculation) = &self.speculation {
+            ensure!(
+                (1..=32).contains(&speculation.max_in_flight)
+                    && (2..=1000).contains(&speculation.min_samples)
+                    && (50..=100).contains(&speculation.confidence_percent)
+                    && (100..=5000).contains(&speculation.max_duration_ms)
+                    && !speculation.rules.is_empty()
+                    && speculation.rules.len() <= 16,
+                "invalid speculation budgets"
+            );
+            for prediction in &speculation.rules {
+                let (server, name) = prediction
+                    .tool
+                    .split_once("__")
+                    .context("prediction requires server prefix")?;
+                let rule = self
+                    .servers
+                    .iter()
+                    .find(|s| s.id == server)
+                    .and_then(|s| s.tools.get(name))
+                    .context("prediction requires explicit tool contract")?;
+                ensure!(
+                    rule.speculative
+                        && rule.reusable
+                        && rule.cache_ttl_ms > 0
+                        && rule.state_tool.is_some(),
+                    "speculation requires an explicitly eligible state-validated read"
+                );
+                ensure!(
+                    prediction.after.len() <= 128
+                        && prediction.after.contains("__")
+                        && prediction.arguments.len() <= 32
+                        && prediction.arguments.keys().all(|key| key.len() <= 128)
+                        && prediction.arguments.values().all(|b| {
+                            let sources =
+                                usize::from(b.input.is_some()) + usize::from(b.result.is_some());
+                            sources == 1
+                                && b.input
+                                    .iter()
+                                    .chain(b.result.iter())
+                                    .all(|p| p.len() <= 256 && (p.is_empty() || p.starts_with('/')))
+                        }),
+                    "invalid prediction argument binding"
+                );
+            }
+        }
+        for user in &self.users {
+            ensure!(
+                user.speculative_tools.len() <= 128
+                    && user
+                        .speculative_tools
+                        .iter()
+                        .all(|tool| tool.len() <= 128 && permits(&user.tools, tool)),
+                "speculative grants must be explicit ordinary tool grants"
+            );
         }
         let mut workflows = BTreeSet::new();
         for workflow in &self.workflows {

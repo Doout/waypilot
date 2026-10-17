@@ -39,6 +39,8 @@ jobs:
             --runs 20 --concurrency 4 --rounds 1 --profile baseline --profile parallel \
             --profile parallel_compiled --profile pooled_parallel --profile pooled_uncached \
             --output target/latency-benchmark.json
+          python3 scripts/benchmark_hr.py target/release/waypilot --runs 8 --concurrency 2 \
+            --tool-ms 20 --think-ms 30 --wrong-every 4 --rounds 1 --output target/hr-benchmark.json
       - name: State validation benchmark controls
         run: |
           export WAYPILOT_PYTHON="$(command -v python3)"
@@ -79,6 +81,7 @@ jobs:
             target/agent-benchmark.json
             target/validation-benchmark.json
             target/latency-benchmark.json
+            target/hr-benchmark.json
             target/observation-scale-smoke.json
             target/observation-scale.json
             target/agent-soak-smoke/*.json

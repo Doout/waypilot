@@ -59,6 +59,11 @@ def main():
         assert len(agent_run["agents"]) == 4
         assert agent_run["upstream"]["calls"]["append_note"] == 2
         assert any(agent["summary"].startswith("Review agrees.") for agent in agent_run["agents"])
+        hr_demo = Path(__file__).resolve().parents[1] / "demos/hr_demo.py"
+        hr_process = subprocess.run([os.environ.get("WAYPILOT_SDK_PYTHON", os.environ["WAYPILOT_PYTHON"]), str(hr_demo), str(binary), "--think-ms", "20", "--tool-ms", "5"], env=environment, capture_output=True, text=True, timeout=45, check=True)
+        hr_run = json.loads(hr_process.stdout)
+        assert hr_run["gateway"]["speculation"]["reused"] >= 2
+        assert hr_run["upstream"]["case_count"] == 5
         from state_support import Client, StateDemo
         private_marker = "waypilot-otel-private-argument-and-result-probe"
         with StateDemo(binary, environment=environment) as state_demo:
@@ -73,9 +78,9 @@ def main():
             assert private_result["structuredContent"]["value"] == private_marker
             client.close()
         serialized_spans = json.dumps(spans)
-        assert all(secret not in serialized_spans for secret in [private_marker, private_receipt, state_demo.token, state_demo.admin]), "arguments, results or credentials leaked into trace fields"
+        assert all(secret not in serialized_spans for secret in ["E-000101", private_marker, private_receipt, state_demo.token, state_demo.admin]), "arguments, results or credentials leaked into trace fields"
         names = {span["name"] for span in spans}
-        required = {"waypilot.run", "waypilot.fragment", "mcp.prewarm", "mcp.tool", "workflow.node", "gateway.http", "mcp.gateway.request", "mcp.prepare", "mcp.invoke", "mcp.state.validate", "mcp.state.validate_batch", "mcp.state.validate_set", "waypilot.cache.lookup"}
+        required = {"waypilot.run", "waypilot.fragment", "mcp.prewarm", "mcp.tool", "workflow.node", "gateway.http", "mcp.gateway.request", "mcp.prepare", "mcp.invoke", "mcp.state.validate", "mcp.state.validate_batch", "mcp.state.validate_set", "waypilot.cache.lookup", "mcp.speculate", "mcp.predict"}
         assert required <= names, f"missing spans: {required - names}; stderr: {process.stderr[-2000:]}"
         dispositions = {
             attr["value"].get("stringValue")

@@ -326,23 +326,23 @@ class Workbench:
         return {"revisions": dict(self.revisions)}
 
 
-def server(workbench):
+def server(workbench, definitions=TOOLS, name="waypilot-incident-workbench"):
     async def list_tools(_context, _params):
-        return types.ListToolsResult(tools=[types.Tool.model_validate(item) for item in TOOLS])
+        return types.ListToolsResult(
+            tools=[types.Tool.model_validate(item) for item in definitions]
+        )
 
     async def call_tool(_context, params):
         return types.CallToolResult.model_validate(
             await workbench.call(params.name, params.arguments or {})
         )
 
-    return Server(
-        "waypilot-incident-workbench", version="1", on_list_tools=list_tools, on_call_tool=call_tool
-    )
+    return Server(name, version="1", on_list_tools=list_tools, on_call_tool=call_tool)
 
 
-async def main(args):
-    workbench = Workbench(args.delay_ms)
-    mcp = server(workbench)
+async def main(args, workbench=None, definitions=TOOLS, name="waypilot-incident-workbench"):
+    workbench = workbench or Workbench(args.delay_ms)
+    mcp = server(workbench, definitions, name)
     if args.stdio:
         async with stdio_server() as (read, write):
             await mcp.run(read, write, mcp.create_initialization_options())

@@ -26,6 +26,7 @@ use state::{Lineage, RemoteState};
 
 mod http;
 mod network;
+mod speculation;
 mod stdio;
 pub use stdio::serve_stdio;
 
@@ -69,6 +70,7 @@ pub(crate) struct Session {
     jobs: Mutex<HashMap<String, CancellationToken>>,
     observations: Mutex<state::Observations>,
     pub stopped: CancellationToken,
+    speculation: Mutex<speculation::SessionState>,
 }
 impl Session {
     pub(crate) fn client(&self, server: &str) -> Option<Arc<Client>> {
@@ -76,6 +78,8 @@ impl Session {
     }
     fn cancel(&self) {
         self.stopped.cancel();
+        *self.speculation.lock().expect("speculation poisoned") =
+            speculation::SessionState::default();
         self.observations
             .lock()
             .expect("observations poisoned")
@@ -135,6 +139,7 @@ pub struct Gateway {
     policy: Arc<tokio::sync::Mutex<crate::policy::Policy>>,
     draining: AtomicBool,
     network_stop: CancellationToken,
+    speculator: speculation::Speculator,
 }
 
 #[derive(Debug)]
@@ -222,6 +227,7 @@ impl Gateway {
         }
         Ok(Arc::new(Self {
             direct: crate::workflow::Single::new(config.max_in_flight)?,
+            speculator: speculation::Speculator::new(config.speculation.as_ref()),
             body_readers: Arc::new(Semaphore::new(config.limits.body_readers)),
             body_bytes: Arc::new(Semaphore::new(config.limits.buffered_bytes)),
             observation_bytes: Arc::new(Semaphore::new(config.limits.observation_bytes)),
@@ -347,6 +353,7 @@ impl Gateway {
             jobs: Mutex::new(HashMap::new()),
             observations: Mutex::new(state::Observations::new(self.observation_bytes.clone())),
             stopped: CancellationToken::new(),
+            speculation: Mutex::new(speculation::SessionState::default()),
         });
         sessions.insert(session.id.clone(), session.clone());
         Ok(session)
@@ -758,6 +765,8 @@ impl Gateway {
         let started = Instant::now();
         let epoch = self.epoch.load(Ordering::Acquire);
         self.authorize(&session, name, epoch)?;
+        let selected_prediction = self.select_prediction(&session, name, &arguments);
+        let prediction_arguments = self.config.speculation.as_ref().map(|_| arguments.clone());
         let inherited = session
             .observations
             .lock()
@@ -808,12 +817,28 @@ impl Gateway {
                     .observations
                     .lock()
                     .expect("observations poisoned")
-                    .retain(outcome.lineage.states, epoch, Instant::now())?;
+                    .retain(
+                        std::mem::take(&mut outcome.lineage.states),
+                        epoch,
+                        Instant::now(),
+                    )?;
                 outcome.result["_meta"][state::OBSERVATIONS] =
                     json!({"receipt":receipt,"ttl_ms":60000});
             }
         }
         outcome.result["_meta"]["io.waypilot/runtime"] = json!({"disposition":outcome.disposition,"elapsed_us":started.elapsed().as_micros(),"generation":epoch});
+        if let Some(arguments) = prediction_arguments.filter(|_| outcome.result["isError"] != true)
+        {
+            self.predict_next(
+                &session,
+                name,
+                &arguments,
+                &outcome,
+                deadline,
+                epoch,
+                selected_prediction.is_some(),
+            );
+        }
         Ok(outcome.result)
     }
 
@@ -1082,7 +1107,7 @@ impl Gateway {
             "buffered_bytes":self.config.limits.buffered_bytes-self.body_bytes.available_permits(),
             "observation_bytes":self.config.limits.observation_bytes-self.observation_bytes.available_permits(),
             "connections":metrics.connections.load(Ordering::Relaxed),"draining":self.draining.load(Ordering::Relaxed),
-            "cleanup":self.cleanup.stats(),"cache":self.cache.stats().unwrap_or(Value::Null)})
+            "speculation":self.speculator.stats(),"cleanup":self.cleanup.stats(),"cache":self.cache.stats().unwrap_or(Value::Null)})
     }
 }
 
