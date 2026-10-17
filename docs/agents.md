@@ -136,3 +136,10 @@ not success. The default profile stays below the fixture's 10,000-note cap. It i
 agent workload at 32 concurrency, distinct from the 1,000-client/500-call qualification.
 State changes occur at barriers; the separate state suite tests mutations during calls.
 An eight-second-per-mode version runs in normal verification and CI.
+
+Run `target/sdk-venv/bin/python load/agent_faults.py target/release/waypilot --iterations 10`
+for controlled mutation, revocation, read-error, deadline and cancellation races during
+agent execution. It checks exact RPC error classes, recovery, upstream dispatch counts
+and cancellation after a note has already been applied. A rendezvous fixture separately
+requires both independent graph branches to arrive before either can finish; parallel
+execution does not depend on a short wall-clock overlap happening by chance.

@@ -8,6 +8,7 @@ permissions:
 jobs:
   verify:
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
@@ -67,3 +68,4 @@ jobs:
             target/agent-demo.json
             target/agent-benchmark.json
             target/agent-soak-smoke/*.json
+            target/agent-faults.json

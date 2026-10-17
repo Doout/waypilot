@@ -14,6 +14,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "demos"))
 from agents.runner import Action, Policy, Responses, run_agent
 from agents.sandbox import Sandbox, connect
+from mcp_demo import ROOT, Process
 from mcp_demo import http as gateway_http
 
 BINARY = str(Path(sys.argv[1]).resolve()) if len(sys.argv) > 1 else "target/debug/waypilot"
@@ -76,6 +77,17 @@ class AgentTests(unittest.TestCase):
             self.assertEqual(stats["calls"]["append_note"], 4)
             self.assertGreater(stats["calls"]["state_version"], 0)
             self.assertGreater(sandbox.stats()["cache"]["invalidated"], 0)
+
+    def test_parallel_graph_branches_rendezvous(self):
+        def process(command, environment):
+            if command[1].endswith("demos/agents/workbench.py"):
+                command = [command[0], str(ROOT / "fixtures/agent_barrier.py"), *command[2:]]
+            return Process(command, environment)
+
+        with patch("agents.sandbox.Process", process), Sandbox(BINARY) as sandbox:
+            report = asyncio.run(investigate(sandbox))
+            self.assertIn("restore_pool_limit", report["summary"])
+            stats = sandbox.peer_stats()
             self.assertGreaterEqual(stats["peak_active"], 2)
             metrics = [row for row in stats["events"] if row["tool"] == "get_metrics"]
             searches = [row for row in stats["events"] if row["tool"] == "search_runbooks"]
