@@ -20,7 +20,7 @@ def percentile(values, fraction):
     return sorted(values)[max(0, math.ceil(len(values) * fraction) - 1)]
 
 
-async def measure(sandbox, runs, concurrency):
+async def measure(sandbox, runs, concurrency, *, guard_observations=False):
     semaphore = asyncio.Semaphore(concurrency)
 
     async def one(index):
@@ -33,6 +33,7 @@ async def measure(sandbox, runs, concurrency):
                     role="investigator",
                     owned_tools=True,
                     capture=True,
+                    guard_observations=guard_observations,
                 )
             expected = "restore_pool_limit" if incident == "INC-101" else "scale_workers"
             if expected not in report["summary"]:
@@ -69,9 +70,12 @@ async def measure(sandbox, runs, concurrency):
         "agent_tool_calls": sum(report["tool_calls"] for report in reports),
         "model_calls": 0,
         "business_calls": sum(
-            count for tool, count in calls.items() if tool not in {"state_version", "append_note"}
+            count
+            for tool, count in calls.items()
+            if tool not in {"state_version", "state_batch", "append_note"}
         ),
-        "validation_calls": calls.get("state_version", 0),
+        "validation_calls": calls.get("state_version", 0) + calls.get("state_batch", 0),
+        "state_checks": sandbox.stats()["state_checks"],
         "effect_calls": calls.get("append_note", 0),
         "total_upstream_calls": sum(calls.values()),
         "per_tool": calls,

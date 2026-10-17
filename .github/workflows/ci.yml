@@ -34,6 +34,7 @@ jobs:
           python3 scripts/benchmark_gateway.py target/release/waypilot --samples 100 > target/gateway-benchmark.json
           python3 demos/agent_demo.py target/release/waypilot --output target/agent-demo.json
           python3 scripts/benchmark_agents.py target/release/waypilot --runs 20 --output target/agent-benchmark.json
+          python3 scripts/benchmark_validation.py target/release/waypilot --runs 20 --concurrency 4 --rounds 1 --output target/validation-benchmark.json
       - name: State validation benchmark controls
         run: |
           export WAYPILOT_PYTHON="$(command -v python3)"
@@ -46,6 +47,11 @@ jobs:
           export WAYPILOT_PYTHON="$(command -v python3)"
           python3 load/state_qualify.py target/release/waypilot \
             --clients 1000 --concurrency 500 --output target/state-scale.json
+      - name: Qualify observation receipts at 1,000 clients
+        if: runner.os == 'Linux'
+        run: |
+          python3 load/observation_qualify.py target/release/waypilot \
+            --clients 1000 --concurrency 500 --output target/observation-scale.json
       - name: Qualify 1,000 clients and 500 concurrent calls
         if: runner.os == 'Linux'
         run: |
@@ -67,5 +73,8 @@ jobs:
             target/state-benchmark.json
             target/agent-demo.json
             target/agent-benchmark.json
+            target/validation-benchmark.json
+            target/observation-scale-smoke.json
+            target/observation-scale.json
             target/agent-soak-smoke/*.json
             target/agent-faults.json

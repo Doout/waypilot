@@ -112,8 +112,49 @@ Responses retain at most 64 distinct validation observations; their arguments an
 maps share the workflow's 1 MiB retained-data budget. Each map permits 1 to 64 resource/version
 pairs with nonempty strings up to 256 bytes. Arguments, results, and version values are not
 trace fields. `mcp.state.validate`, `waypilot.cache.lookup`, and the graph's `validate_state`
-node expose validation, lookup, and release-barrier timing. Admin statistics count validation
-calls, conflicts, and cache invalidations.
+node expose validation, lookup, and release-barrier timing. Admin statistics count validated
+observations (`state_checks`), batch RPCs (`state_batches`), conflicts, and cache invalidations.
+
+### Batch validation
+
+An eligible read can also set `state_batch_tool = "document_versions"`. When two or more
+observations use that validator on the same configured server, Waypilot sends one call:
+`{"version":1,"observations":[{"id":"0","tool":"read_document","arguments":{"id":"42"}},...]}`.
+The reply must carry `_meta["io.waypilot/state-batch"]` with `version: 1` and an
+`observations` array of `{"id":"0","state":{"version":1,"resources":{"doc:42":"revision-19"}}}`.
+IDs must match every requested observation exactly once; order may differ. The server must
+capture all versions without interleaved mutation. Missing, duplicate, malformed or changed
+witnesses fail closed, with no single-call fallback. Single observations use `state_tool`.
+
+Batching preserves the validation points and charges one rate token per observation.
+Users need grants for both validators and the original reads. Batches share upstream
+admission and the original deadline. `mcp.state.validate_batch` exposes duration and count;
+arguments and versions stay out of traces. Servers without the batch contract keep using
+individual RPCs.
+
+### Observations across MCP calls
+
+A client can request `params._meta["io.waypilot/observations"] = {"capture":true}` on a
+stateful read or workflow. The result returns `{"receipt":"<opaque handle>","ttl_ms":60000}`
+under the same metadata key. A workflow receipt covers its recorded stateful observations,
+including branches absent from its selected outputs. It does not attest to unconfigured reads.
+
+On a later call, send `{"require":["<opaque handle>"]}` under that key. Waypilot resolves
+the handles in the same MCP session and policy generation, checks current access and
+versions before starting the call, and rechecks before releasing its result. Changed,
+unknown, expired or foreign handles return `-32010`; no stale fallback or automatic retry.
+This is opt-in. Ordinary calls do not inherit earlier observations automatically.
+
+Each session retains at most 64 receipts and a 1 MiB evidence budget for 60 seconds. The
+shared `limits.observation_bytes` budget defaults to 16 MiB; expiry, policy changes and
+session cleanup release capacity. Capacity exhaustion returns `-32029`. Handles never
+contain arguments or authorization decisions, and are not forwarded to upstream tools.
+Runtime elapsed time includes the required observation checks.
+
+A resource can change after validation or while a remote effect runs. A conflict, timeout
+or cancellation after dispatch can leave an applied effect without a successful response.
+Atomic conditional writes require upstream support; receipts provide neither rollback nor
+an atomic conversation snapshot.
 
 The [state regression suite](../scripts/check_state.py) exercises HTTP JSON, HTTP SSE and
 stdio peers, including external mutation with unchanged downstream arguments. See

@@ -39,6 +39,18 @@ The sustained workload offers 500 calls/second against a tool with a 10 ms wait.
 
 Concurrency barriers and sustained throughput measure separate cases. The generator, peer and collector share the host. RSS and descriptor peaks are sampled. These results cover one node and local HTTP peers; they do not establish WAN/TLS performance, multi-hour stability, large stdio fleets or multi-replica behavior.
 
+The observation-receipt scale test uses cooperative workbench tools. It captures graph
+receipts on every session, uses 64 upstream slots behind 500 pending calls, applies one
+guarded note per client, advances both metric revisions without changing values, rejects
+every stale note, then recaptures and writes
+once per client. It reconciles the upstream ledger, samples RSS and checks that receipt
+storage and sessions drain. Concurrency here counts pending gateway calls.
+
+```sh
+target/sdk-venv/bin/python load/observation_qualify.py target/release/waypilot \
+  --clients 1000 --concurrency 500 --output target/observation-scale.json
+```
+
 ## Forwarding overhead
 
 ```sh

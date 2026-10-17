@@ -44,6 +44,7 @@ pub struct ResourceLimits {
     pub admin_requests: usize,
     pub request_bytes: usize,
     pub buffered_bytes: usize,
+    pub observation_bytes: usize,
     pub upstream_calls: usize,
     pub upstream_initializations: usize,
     pub upstream_idle_per_host: usize,
@@ -59,6 +60,7 @@ impl Default for ResourceLimits {
             admin_requests: 16,
             request_bytes: 1024 * 1024,
             buffered_bytes: 32 * 1024 * 1024,
+            observation_bytes: 16 * 1024 * 1024,
             upstream_calls: 512,
             upstream_initializations: 64,
             upstream_idle_per_host: 64,
@@ -136,6 +138,9 @@ pub struct ToolRule {
     /// Opt-in state contract; validator is called with the original tool name and arguments.
     #[serde(default)]
     pub state_tool: Option<String>,
+    /// Optional state-batch-v1 validator; each observation still consumes rate budget.
+    #[serde(default)]
+    pub state_batch_tool: Option<String>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -240,6 +245,7 @@ impl Config {
                 && (1..=256).contains(&limits.admin_requests)
                 && (1024..=1024 * 1024).contains(&limits.request_bytes)
                 && (limits.request_bytes..=1024 * 1024 * 1024).contains(&limits.buffered_bytes)
+                && (1024..=256 * 1024 * 1024).contains(&limits.observation_bytes)
                 && (1..=8192).contains(&limits.upstream_calls)
                 && (1..=1024).contains(&limits.upstream_initializations)
                 && (0..=8192).contains(&limits.upstream_idle_per_host)
@@ -303,6 +309,22 @@ impl Config {
             );
             server.endpoint.validate()?;
             for (tool, rule) in &server.tools {
+                if let Some(batch) = &rule.state_batch_tool {
+                    ensure!(
+                        rule.state_tool.is_some()
+                            && batch != tool
+                            && !batch.is_empty()
+                            && batch.len() <= 128
+                            && !batch.chars().any(char::is_control),
+                        "batch validation requires state_tool and a distinct validator"
+                    );
+                    ensure!(
+                        server.tools.get(batch).is_none_or(
+                            |rule| rule.state_tool.is_none() && rule.state_batch_tool.is_none()
+                        ),
+                        "batch validators cannot require validation"
+                    );
+                }
                 if let Some(validator) = &rule.state_tool {
                     ensure!(
                         server

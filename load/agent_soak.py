@@ -158,7 +158,11 @@ async def measure(args, label, reuse, collector, progress_path):
     }
     write_json(args.output_dir / (label + ".json"), output)
     with Sandbox(
-        args.binary, reuse=reuse, delay_ms=args.delay_ms, environment=environment
+        args.binary,
+        reuse=reuse,
+        delay_ms=args.delay_ms,
+        environment=environment,
+        batch_validation=reuse and args.batch_validation,
     ) as sandbox:
         gateway = psutil.Process(sandbox.service.process.pid)
         peer_process = psutil.Process(sandbox.peer_process.process.pid)
@@ -234,6 +238,7 @@ async def measure(args, label, reuse, collector, progress_path):
                                     capture=True,
                                     owned_tools=True,
                                     timeout=30,
+                                    guard_observations=reuse and args.guard_observations,
                                 )
                             digest, note_id = check_report(
                                 report, incident, recovered, role, run_id
@@ -332,10 +337,12 @@ async def measure(args, label, reuse, collector, progress_path):
                     "business_calls": sum(
                         after["calls"].get(key, 0) - before["calls"].get(key, 0)
                         for key in after["calls"]
-                        if key not in {"state_version", "append_note"}
+                        if key not in {"state_version", "state_batch", "append_note"}
                     ),
-                    "validation_calls": after["calls"].get("state_version", 0)
-                    - before["calls"].get("state_version", 0),
+                    "validation_calls": sum(
+                        after["calls"].get(name, 0) - before["calls"].get(name, 0)
+                        for name in ["state_version", "state_batch"]
+                    ),
                     "notes": after["note_count"],
                     "gateway_rss_bytes": gateway.memory_info().rss,
                     "drained_fds": gateway.num_fds(),
@@ -480,6 +487,8 @@ async def main(args):
             "business_tool_delay_ms": args.delay_ms,
             "trace_ratio": args.trace_ratio,
             "model_calls": 0,
+            "batch_validation": args.batch_validation,
+            "guard_observations": args.guard_observations,
             "mutations": "barrier-separated value changes and same-value revisions; separate failure/race qualification required",
             "comparison": "all structured business observations, excluding runtime metadata, graph timings and generated note IDs",
         },
@@ -519,6 +528,8 @@ if __name__ == "__main__":
     parser.add_argument("--delay-ms", type=int, default=30)
     parser.add_argument("--trace-ratio", type=float, default=0.01)
     parser.add_argument("--max-rss-mb", type=int, default=512)
+    parser.add_argument("--batch-validation", action="store_true")
+    parser.add_argument("--guard-observations", action="store_true")
     parser.add_argument("--revision", default="working-tree")
     parser.add_argument("--output-dir", type=Path, default=Path("target/agent-soak"))
     args = parser.parse_args()

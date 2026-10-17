@@ -46,6 +46,10 @@ class Sandbox:
         binary,
         *,
         reuse=True,
+        batch_validation=False,
+        max_sessions=128,
+        max_in_flight=64,
+        upstream_calls=512,
         delay_ms=30,
         timeout_ms=10000,
         start_http=True,
@@ -95,9 +99,11 @@ class Sandbox:
             self.peer = "http://" + peer.ready["listen"]
             text = f"""listen = "127.0.0.1:0"
 admin_token_env = "AGENT_ADMIN"
-max_sessions = 128
-max_in_flight = 64
+max_sessions = {max_sessions}
+max_in_flight = {max_in_flight}
 request_timeout_ms = {timeout_ms}
+[limits]
+upstream_calls = {upstream_calls}
 """
             reads = [
                 "ops__get_incident",
@@ -110,6 +116,8 @@ request_timeout_ms = {timeout_ms}
                 "knowledge__state_version",
                 "waypilot__triage",
             ]
+            if batch_validation:
+                reads += ["ops__state_batch", "knowledge__state_batch"]
             for role in ["investigator", "reviewer"]:
                 grants = reads + (["ops__append_note"] if role == "investigator" else [])
                 text += f'''[[users]]
@@ -137,6 +145,8 @@ url = "{self.peer}/mcp"
                         text += f"[servers.tools.{tool}]\nreusable = true\ncache_ttl_ms = 60000\n"
                         if tool != "assess":
                             text += 'state_tool = "state_version"\n'
+                            if batch_validation:
+                                text += 'state_batch_tool = "state_batch"\n'
             text += """[[workflows]]
 name = "triage"
 description = "Read live telemetry and deployment, search runbooks concurrently, then assess the evidence. No writes."

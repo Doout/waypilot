@@ -54,7 +54,7 @@ def main():
         live = json.loads(process.stdout)
         assert [case["upstream_calls"] for case in live["workflow"]] == [4, 0, 2]
         agent_demo = Path(__file__).resolve().parents[1] / "demos/agent_demo.py"
-        agent_process = subprocess.run([os.environ.get("WAYPILOT_SDK_PYTHON", os.environ["WAYPILOT_PYTHON"]), str(agent_demo), str(binary)], env=environment, capture_output=True, text=True, timeout=45, check=True)
+        agent_process = subprocess.run([os.environ.get("WAYPILOT_SDK_PYTHON", os.environ["WAYPILOT_PYTHON"]), str(agent_demo), str(binary), "--batch-validation", "--guard-observations"], env=environment, capture_output=True, text=True, timeout=45, check=True)
         agent_run = json.loads(agent_process.stdout)
         assert len(agent_run["agents"]) == 4
         assert agent_run["upstream"]["calls"]["append_note"] == 2
@@ -68,13 +68,14 @@ def main():
             state_demo.mutate(key="a", touch=True)
             client.call("waypilot__state", {})
             state_demo.mutate(key="a", value=private_marker)
-            private_result = client.call("owned__state_read", {"key": "a", "private_context": private_marker})
+            private_result = client.request("tools/call", {"name": "owned__state_read", "arguments": {"key": "a", "private_context": private_marker}, "_meta": {"io.waypilot/observations": {"capture": True}}})["result"]
+            private_receipt = private_result["_meta"]["io.waypilot/observations"]["receipt"]
             assert private_result["structuredContent"]["value"] == private_marker
             client.close()
         serialized_spans = json.dumps(spans)
-        assert all(secret not in serialized_spans for secret in [private_marker, state_demo.token, state_demo.admin]), "arguments, results or credentials leaked into trace fields"
+        assert all(secret not in serialized_spans for secret in [private_marker, private_receipt, state_demo.token, state_demo.admin]), "arguments, results or credentials leaked into trace fields"
         names = {span["name"] for span in spans}
-        required = {"waypilot.run", "waypilot.fragment", "mcp.prewarm", "mcp.tool", "workflow.node", "gateway.http", "mcp.gateway.request", "mcp.prepare", "mcp.invoke", "mcp.state.validate", "waypilot.cache.lookup"}
+        required = {"waypilot.run", "waypilot.fragment", "mcp.prewarm", "mcp.tool", "workflow.node", "gateway.http", "mcp.gateway.request", "mcp.prepare", "mcp.invoke", "mcp.state.validate", "mcp.state.validate_batch", "waypilot.cache.lookup"}
         assert required <= names, f"missing spans: {required - names}; stderr: {process.stderr[-2000:]}"
         dispositions = {
             attr["value"].get("stringValue")

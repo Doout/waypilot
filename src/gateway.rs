@@ -67,6 +67,7 @@ pub(crate) struct Session {
     touched: Mutex<Instant>,
     clients: BTreeMap<String, Arc<Client>>,
     jobs: Mutex<HashMap<String, CancellationToken>>,
+    observations: Mutex<state::Observations>,
     pub stopped: CancellationToken,
 }
 impl Session {
@@ -75,6 +76,10 @@ impl Session {
     }
     fn cancel(&self) {
         self.stopped.cancel();
+        self.observations
+            .lock()
+            .expect("observations poisoned")
+            .clear();
         for token in self.jobs.lock().expect("session jobs poisoned").values() {
             token.cancel();
         }
@@ -89,6 +94,7 @@ struct Metrics {
     cache_misses: AtomicU64,
     cache_bypasses: AtomicU64,
     state_checks: AtomicU64,
+    state_batches: AtomicU64,
     state_conflicts: AtomicU64,
     denied: AtomicU64,
     prewarms: AtomicU64,
@@ -123,6 +129,7 @@ pub struct Gateway {
     preparing: Arc<Semaphore>,
     body_readers: Arc<Semaphore>,
     body_bytes: Arc<Semaphore>,
+    observation_bytes: Arc<Semaphore>,
     admin_admission: Arc<Semaphore>,
     cleanup: Arc<crate::upstream_cleanup::Cleanup>,
     policy: Arc<tokio::sync::Mutex<crate::policy::Policy>>,
@@ -217,6 +224,7 @@ impl Gateway {
             direct: crate::workflow::Single::new(config.max_in_flight)?,
             body_readers: Arc::new(Semaphore::new(config.limits.body_readers)),
             body_bytes: Arc::new(Semaphore::new(config.limits.buffered_bytes)),
+            observation_bytes: Arc::new(Semaphore::new(config.limits.observation_bytes)),
             admin_admission: Arc::new(Semaphore::new(config.limits.admin_requests)),
             upstream_admission: Arc::new(Semaphore::new(config.limits.upstream_calls)),
             cleanup,
@@ -276,8 +284,12 @@ impl Gateway {
                         .iter()
                         .find(|item| item.id == server)
                         .and_then(|item| item.tools.get(name))
-                        .and_then(|rule| rule.state_tool.as_ref())
-                        .map(|validator| actor.permits(&format!("{server}__{validator}")))
+                        .map(|rule| {
+                            [&rule.state_tool, &rule.state_batch_tool]
+                                .into_iter()
+                                .flatten()
+                                .all(|validator| actor.permits(&format!("{server}__{validator}")))
+                        })
                 })
                 .unwrap_or(true)
     }
@@ -333,6 +345,7 @@ impl Gateway {
             touched: Mutex::new(Instant::now()),
             clients,
             jobs: Mutex::new(HashMap::new()),
+            observations: Mutex::new(state::Observations::new(self.observation_bytes.clone())),
             stopped: CancellationToken::new(),
         });
         sessions.insert(session.id.clone(), session.clone());
@@ -456,6 +469,10 @@ impl Gateway {
         let own_state = if let Some(validator) = rule.and_then(|rule| rule.state_tool.as_ref()) {
             let mut state = RemoteState {
                 validator: format!("{server_id}__{validator}"),
+                tool: name.into(),
+                batch_validator: rule
+                    .and_then(|r| r.state_batch_tool.as_ref())
+                    .map(|batch| format!("{server_id}__{batch}")),
                 arguments: json!({"tool":tool,"arguments":arguments}),
                 evidence: Evidence::default(),
                 key: key.as_ref().expect("state key").clone(),
@@ -736,9 +753,18 @@ impl Gateway {
         name: &str,
         arguments: Value,
         deadline: tokio::time::Instant,
+        observations: state::ObservationRequest,
     ) -> Result<Value, Fault> {
+        let started = Instant::now();
         let epoch = self.epoch.load(Ordering::Acquire);
         self.authorize(&session, name, epoch)?;
+        let inherited = session
+            .observations
+            .lock()
+            .expect("observations poisoned")
+            .resolve(&observations.require, epoch, Instant::now())?;
+        self.validate_states(&session, &inherited, deadline, epoch)
+            .await?;
         let mut outcome = if let Some(workflow) = self.workflows.get(name) {
             if !session.actor.consume() {
                 return Err(Fault {
@@ -762,7 +788,32 @@ impl Gateway {
                 .await?
         };
         self.authorize(&session, name, epoch)?;
-        outcome.result["_meta"]["io.waypilot/runtime"] = json!({"disposition":outcome.disposition,"elapsed_us":outcome.elapsed_us,"generation":epoch});
+        // Recheck inherited observations at release as well. An upstream effect
+        // may already have happened; this is not a distributed transaction.
+        self.validate_states(&session, &inherited, deadline, epoch)
+            .await?;
+        if let Some(meta) = outcome
+            .result
+            .get_mut("_meta")
+            .and_then(Value::as_object_mut)
+        {
+            meta.remove(state::OBSERVATIONS);
+        }
+        if observations.capture {
+            for state in inherited {
+                outcome.lineage.add_state(state)?;
+            }
+            if !outcome.lineage.states.is_empty() {
+                let receipt = session
+                    .observations
+                    .lock()
+                    .expect("observations poisoned")
+                    .retain(outcome.lineage.states, epoch, Instant::now())?;
+                outcome.result["_meta"][state::OBSERVATIONS] =
+                    json!({"receipt":receipt,"ttl_ms":60000});
+            }
+        }
+        outcome.result["_meta"]["io.waypilot/runtime"] = json!({"disposition":outcome.disposition,"elapsed_us":started.elapsed().as_micros(),"generation":epoch});
         Ok(outcome.result)
     }
 
@@ -901,7 +952,19 @@ impl Gateway {
                     if !args.is_object() {
                         return Err(Fault::invalid());
                     }
-                    self.tool(session.clone(), name, args, deadline).await
+                    if value
+                        .pointer("/params/_meta")
+                        .is_some_and(|meta| !meta.is_object())
+                    {
+                        return Err(Fault::invalid());
+                    }
+                    let observations = state::ObservationRequest::parse(
+                        value
+                            .pointer("/params/_meta")
+                            .and_then(|meta| meta.get(state::OBSERVATIONS)),
+                    )?;
+                    self.tool(session.clone(), name, args, deadline, observations)
+                        .await
                 }
                 _ => Err(Fault {
                     code: -32601,
@@ -967,6 +1030,13 @@ impl Gateway {
             tokio::select! { _ = self.network_stop.cancelled() => break, _ = interval.tick() => {} }
             let expired = {
                 let mut sessions = self.sessions.lock().expect("sessions poisoned");
+                for session in sessions.values() {
+                    session
+                        .observations
+                        .lock()
+                        .expect("observations poisoned")
+                        .prune(self.epoch.load(Ordering::Acquire), Instant::now());
+                }
                 let ids: Vec<_> = sessions
                     .iter()
                     .filter(|(_, session)| {
@@ -1001,7 +1071,7 @@ impl Gateway {
         json!({"generation":self.epoch.load(Ordering::Acquire),"sessions":self.sessions.lock().expect("sessions poisoned").len(),
             "requests":metrics.requests.load(Ordering::Relaxed),"upstream_calls":metrics.upstream_calls.load(Ordering::Relaxed),
             "cache_hits":metrics.cache_hits.load(Ordering::Relaxed),"cache_misses":metrics.cache_misses.load(Ordering::Relaxed),
-            "cache_bypasses":metrics.cache_bypasses.load(Ordering::Relaxed),"state_checks":metrics.state_checks.load(Ordering::Relaxed),"state_conflicts":metrics.state_conflicts.load(Ordering::Relaxed),"denied":metrics.denied.load(Ordering::Relaxed),
+            "cache_bypasses":metrics.cache_bypasses.load(Ordering::Relaxed),"state_checks":metrics.state_checks.load(Ordering::Relaxed),"state_batches":metrics.state_batches.load(Ordering::Relaxed),"state_conflicts":metrics.state_conflicts.load(Ordering::Relaxed),"denied":metrics.denied.load(Ordering::Relaxed),
             "prewarms":metrics.prewarms.load(Ordering::Relaxed),"prewarm_errors":metrics.prewarm_errors.load(Ordering::Relaxed),
             "rejected_capacity":metrics.rejected.load(Ordering::Relaxed),"sessions_expired":metrics.expired.load(Ordering::Relaxed),
             "active_requests":self.config.max_in_flight-self.admission.available_permits(),
@@ -1009,6 +1079,7 @@ impl Gateway {
             "active_initializations":self.config.limits.upstream_initializations-self.preparing.available_permits(),
             "body_readers":self.config.limits.body_readers-self.body_readers.available_permits(),
             "buffered_bytes":self.config.limits.buffered_bytes-self.body_bytes.available_permits(),
+            "observation_bytes":self.config.limits.observation_bytes-self.observation_bytes.available_permits(),
             "connections":metrics.connections.load(Ordering::Relaxed),"draining":self.draining.load(Ordering::Relaxed),
             "cleanup":self.cleanup.stats(),"cache":self.cache.stats().unwrap_or(Value::Null)})
     }

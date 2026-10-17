@@ -102,6 +102,24 @@ TOOLS = [
         readonly=False,
     ),
     tool(
+        "state_batch",
+        "Gateway-only state-batch-v1 validator; one snapshot for all requested observations.",
+        {
+            "version": {"const": 1},
+            "observations": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 64,
+                "items": {
+                    "type": "object",
+                    "properties": {"id": STRING, "tool": STRING, "arguments": {"type": "object"}},
+                    "required": ["id", "tool", "arguments"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+    ),
+    tool(
         "state_version",
         "Gateway-only state-v1 validator for an eligible read.",
         {"tool": STRING, "arguments": {"type": "object"}},
@@ -179,9 +197,28 @@ class Workbench:
             if name in self.fail_next:
                 self.fail_next.remove(name)
                 raise ValueError("injected workbench failure")
-            checking = name == "state_version"
+            checking = name in {"state_version", "state_batch"}
             evidence = None
-            if name in STATEFUL or checking:
+            batch = None
+            if name == "state_batch":
+                batch = []
+                for observation in arguments["observations"]:
+                    read_name, query = observation["tool"], observation["arguments"]
+                    if read_name not in STATEFUL:
+                        raise ValueError("unsupported batch target")
+                    validate(query, CATALOG[read_name]["inputSchema"])
+                    _, resource = self.read(read_name, query)
+                    batch.append(
+                        {
+                            "id": observation["id"],
+                            "state": {
+                                "version": 1,
+                                "resources": {resource: f"{self.epoch}:{self.revisions[resource]}"},
+                            },
+                        }
+                    )
+                value = {}
+            elif name in STATEFUL or checking:
                 read_name = arguments["tool"] if checking else name
                 query = arguments["arguments"] if checking else arguments
                 if read_name not in STATEFUL:
@@ -229,6 +266,8 @@ class Workbench:
                 "structuredContent": value,
                 "isError": False,
             }
+            if batch is not None:
+                result["_meta"] = {"io.waypilot/state-batch": {"version": 1, "observations": batch}}
             if evidence is not None:
                 result["_meta"] = {STATE_META: evidence}
             return result

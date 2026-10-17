@@ -47,6 +47,7 @@ async def run(args, sandbox=None):
                     role=role,
                     timeout=args.timeout,
                     owned_tools=sandbox is not None,
+                    guard_observations=args.guard_observations,
                 )
                 report["iteration"] = index + 1
                 reports.append(report)
@@ -80,6 +81,8 @@ def arguments():
     parser.add_argument("--repeat", type=int, default=2)
     parser.add_argument("--transport", choices=["http", "stdio"], default="http")
     parser.add_argument("--no-reuse", action="store_true")
+    parser.add_argument("--batch-validation", action="store_true")
+    parser.add_argument("--guard-observations", action="store_true")
     parser.add_argument("--timeout", type=float, default=120)
     parser.add_argument("--model", help="Explicit model ID; required in model mode")
     parser.add_argument("--model-endpoint", default="https://api.openai.com/v1/responses")
@@ -91,6 +94,8 @@ def arguments():
     parser.add_argument("--task", help="Task for live-model mode")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
+    if args.no_reuse and (args.batch_validation or args.guard_observations):
+        parser.error("batch validation and observation guards require state-enabled reuse")
     if not 1 <= args.repeat <= 100 or not 0 < args.timeout <= 600:
         parser.error("repeat must be 1..100 and timeout 0..600 seconds")
     if args.mode == "model" and (not args.model or not os.environ.get(args.model_key_env)):
@@ -112,7 +117,10 @@ def main():
         result = asyncio.run(run(args))
     else:
         with Sandbox(
-            args.binary, reuse=not args.no_reuse, start_http=args.transport == "http"
+            args.binary,
+            reuse=not args.no_reuse,
+            start_http=args.transport == "http",
+            batch_validation=args.batch_validation,
         ) as sandbox:
             result = asyncio.run(run(args, sandbox))
     encoded = json.dumps(result, indent=2)

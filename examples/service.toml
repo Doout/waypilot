@@ -14,6 +14,7 @@ body_readers = 500
 admin_requests = 16
 request_bytes = 65536
 buffered_bytes = 16777216
+observation_bytes = 16777216
 upstream_calls = 500
 upstream_initializations = 64
 upstream_idle_per_host = 500

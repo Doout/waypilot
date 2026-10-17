@@ -11,6 +11,17 @@ from dataclasses import dataclass
 
 from jsonschema import ValidationError, validate
 
+# Authored read contract for the owned workbench; annotations do not extend it.
+OWNED_READS = {
+    "ops__get_incident",
+    "ops__get_metrics",
+    "ops__get_deployment",
+    "knowledge__search_runbooks",
+    "knowledge__get_runbook",
+    "knowledge__assess",
+    "waypilot__triage",
+}
+
 
 @dataclass
 class Action:
@@ -196,6 +207,7 @@ async def run_agent(
     timeout=120,
     capture=False,
     owned_tools=False,
+    guard_observations=False,
 ):
     started = time.perf_counter_ns()
     observations, timings = [], []
@@ -211,14 +223,40 @@ async def run_agent(
     )
     # State validators are an internal gateway detail, not an agent action.
     visible = {
-        tool["name"]: tool for tool in catalog if not tool["name"].endswith("__state_version")
+        tool["name"]: tool
+        for tool in catalog
+        if not tool["name"].endswith(("__state_version", "__state_batch"))
     }
     calls = 0
+    receipts = []
 
     async def invoke(action):
         begin = time.perf_counter_ns()
         # Protocol/access faults abort the run. Never replay a failed effect.
-        result = (await client.call_tool(action.name, action.arguments)).model_dump(by_alias=True)
+        kwargs = {}
+        if guard_observations:
+            # Explicit opt-in, including remote gateways: unsupported gateways must
+            # return a receipt for observed reads or the runner stops before a write.
+            readonly = action.name in OWNED_READS
+            if not readonly and not receipts:
+                raise RuntimeError("guarded action requires prior observation receipts")
+            kwargs["meta"] = {
+                "io.waypilot/observations": {
+                    "capture": readonly,
+                    "require": [] if readonly else list(receipts),
+                }
+            }
+        result = (await client.call_tool(action.name, action.arguments, **kwargs)).model_dump(
+            by_alias=True
+        )
+        if guard_observations:
+            receipt = result.get("_meta", {}).pop("io.waypilot/observations", {}).get("receipt")
+            if receipt:
+                if not isinstance(receipt, str) or len(receipt) != 64 or len(receipts) >= 64:
+                    raise RuntimeError("invalid or excessive observation receipts")
+                receipts.append(receipt)
+            elif readonly and action.name != "knowledge__assess":
+                raise RuntimeError("gateway did not retain the required observation")
         timings.append(
             {
                 "phase": "tool",
@@ -275,16 +313,7 @@ async def run_agent(
             calls += len(decision)
             # Only the owned, known read tools may run in parallel. Unknown remote
             # tools and all writes serialize regardless of their annotations.
-            read_names = {
-                "ops__get_incident",
-                "ops__get_metrics",
-                "ops__get_deployment",
-                "knowledge__search_runbooks",
-                "knowledge__get_runbook",
-                "knowledge__assess",
-                "waypilot__triage",
-            }
-            if owned_tools and all(action.name in read_names for action in decision):
+            if owned_tools and all(action.name in OWNED_READS for action in decision):
                 tasks = [asyncio.create_task(invoke(action)) for action in decision]
                 try:
                     observations.extend(await asyncio.gather(*tasks))

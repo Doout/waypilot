@@ -489,11 +489,19 @@ impl Compiled {
             .expect("released workflow result")
             .clone();
         let result = json!({"content":[{"type":"text","text":output.to_string()}],"structuredContent":output,"isError":false});
+        let states = call
+            .states
+            .lock()
+            .expect("workflow states poisoned")
+            .clone();
         Ok(Outcome {
             result,
             disposition: "workflow",
             elapsed_us: started.elapsed().as_micros(),
-            lineage: Lineage::default(),
+            lineage: Lineage {
+                states,
+                ..Lineage::default()
+            },
         })
     }
 }

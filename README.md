@@ -2,7 +2,8 @@
 
 Waypilot is an MCP gateway built on [Wayframe](https://github.com/Doout/wayframe). It routes calls to HTTP or stdio servers and runs configured workflows with parallel branches and joins. It has bearer authentication, tool grants, rate limits, result reuse, server prewarming and OpenTelemetry traces.
 
-Cooperative upstreams can opt into [remote state validation](docs/gateway.md#remote-state-validation) and dependency-aware branch invalidation.
+Cooperative upstreams can opt into [remote state validation](docs/gateway.md#remote-state-validation) and dependency-aware branch invalidation, with optional batch validation and observation
+receipts to check earlier reads before a later call.
 
 The [incident-agent workbench](docs/agents.md) runs an investigator and read-only reviewer
 through real MCP tools, with a free policy mode, optional model mode and an uncached
