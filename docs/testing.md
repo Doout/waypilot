@@ -6,6 +6,10 @@ Follow the [README](../README.md#test-and-benchmark) to install test dependencie
 
 CI runs on Linux and macOS. Linux also runs the 1,000-client/500-call release test. Artifacts include `scale-smoke.json`, `benchmark.json`, `gateway-benchmark.json` and `mcp-demo.json`, plus Linux `scale-qualification.json`. Reports upload on failure too.
 
+The [incident-agent suite](agents.md#verify-and-compare) adds real multi-turn MCP callers,
+policy decisions, read-only review, state mutation and required writes. Verification
+runs its regression tests; CI also uploads `agent-demo.json` and `agent-benchmark.json`.
+
 ## Load test
 
 Run on Linux or macOS with other builds and benchmarks stopped. The runner starts local peers, creates temporary credentials and state, and stops its processes afterward. It raises the soft descriptor limit when possible and rejects an insufficient hard limit. It sends no traffic to public servers.

@@ -53,6 +53,12 @@ def main():
         process = subprocess.run([os.environ["WAYPILOT_PYTHON"], str(demo), str(binary)], env=environment, capture_output=True, text=True, timeout=45, check=True)
         live = json.loads(process.stdout)
         assert [case["upstream_calls"] for case in live["workflow"]] == [4, 0, 2]
+        agent_demo = Path(__file__).resolve().parents[1] / "demos/agent_demo.py"
+        agent_process = subprocess.run([os.environ.get("WAYPILOT_SDK_PYTHON", os.environ["WAYPILOT_PYTHON"]), str(agent_demo), str(binary)], env=environment, capture_output=True, text=True, timeout=45, check=True)
+        agent_run = json.loads(agent_process.stdout)
+        assert len(agent_run["agents"]) == 4
+        assert agent_run["upstream"]["calls"]["append_note"] == 2
+        assert any(agent["summary"].startswith("Review agrees.") for agent in agent_run["agents"])
         from state_support import Client, StateDemo
         with StateDemo(binary, environment=environment) as state_demo:
             client = Client(state_demo.base, state_demo.token)

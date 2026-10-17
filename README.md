@@ -4,6 +4,10 @@ Waypilot is an MCP gateway built on [Wayframe](https://github.com/Doout/wayframe
 
 Cooperative upstreams can opt into [remote state validation](docs/gateway.md#remote-state-validation) and dependency-aware branch invalidation.
 
+The [incident-agent workbench](docs/agents.md) runs an investigator and read-only reviewer
+through real MCP tools, with a free policy mode, optional model mode and an uncached
+benchmark baseline. Start it with `bash scripts/agent_demo.sh` after installing the test dependencies.
+
 This is a single-node pre-release. Workflows come from TOML. Prewarming prepares servers without invoking tools.
 
 ## Try the demo
