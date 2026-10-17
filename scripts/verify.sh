@@ -13,6 +13,7 @@ cargo build --locked
 "$WAYPILOT_PYTHON" scripts/check_state.py target/debug/waypilot
 "${WAYPILOT_SDK_PYTHON:-$WAYPILOT_PYTHON}" scripts/check_sdk.py target/debug/waypilot
 "${WAYPILOT_SDK_PYTHON:-$WAYPILOT_PYTHON}" scripts/check_agents.py target/debug/waypilot
+"${WAYPILOT_SDK_PYTHON:-$WAYPILOT_PYTHON}" load/agent_soak.py target/debug/waypilot --seconds 8 --wave-seconds 2 --rate 2 --concurrency 4 --trace-ratio 1 --output-dir target/agent-soak-smoke
 "$WAYPILOT_PYTHON" scripts/check_otel.py target/debug/waypilot
 
 "$WAYPILOT_PYTHON" load/qualify.py target/debug/waypilot --clients 64 --concurrency 32 --seconds 3 --rate 100 --trace-ratio 0.1 --output target/scale-smoke.json

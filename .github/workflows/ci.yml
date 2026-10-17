@@ -66,3 +66,4 @@ jobs:
             target/state-benchmark.json
             target/agent-demo.json
             target/agent-benchmark.json
+            target/agent-soak-smoke/*.json

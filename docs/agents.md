@@ -112,3 +112,27 @@ tools, access faults and exhausted budgets stop the run; effects are never retri
 Cancellation cannot undo a note already appended upstream. State validation applies
 to individual gateway calls and authored graph dependencies, not an atomic snapshot
 of an entire agent conversation.
+
+## Sustained E2E
+
+```sh
+target/sdk-venv/bin/python load/agent_soak.py target/release/waypilot \
+  --seconds 600 --wave-seconds 20 --rate 12 --concurrency 32 \
+  --revision "$(git rev-parse HEAD)" --output-dir target/agent-soak
+```
+
+This runs ten minutes per mode: uncached, then validated reuse. Each 20-second wave
+starts 32 agents together and continues at 12 agents/second. Three quarters investigate
+and write; the rest review earlier proposals. Between drained waves the upstream changes
+values, advances revisions without changing values, or remains unchanged. Every decision
+is checked against a separate scenario oracle, and normalized structured observations
+must match across modes. A final upstream ledger must contain exactly one note for each
+successful investigation and none for reviews.
+
+The runner checks session/call/singleflight/cleanup drainage, cache bounds, descriptors,
+RSS and sampled OTLP node/validation spans. It writes per-wave progress, resource samples,
+per-run evidence hashes and a final `summary.json`; a missing or non-passing summary is
+not success. The default profile stays below the fixture's 10,000-note cap. It is an
+agent workload at 32 concurrency, distinct from the 1,000-client/500-call qualification.
+State changes occur at barriers; the separate state suite tests mutations during calls.
+An eight-second-per-mode version runs in normal verification and CI.

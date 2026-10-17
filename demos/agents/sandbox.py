@@ -41,7 +41,16 @@ async def connect(url, token, *, sandbox=None, role="investigator", transport="h
 
 
 class Sandbox:
-    def __init__(self, binary, *, reuse=True, delay_ms=30, timeout_ms=10000, start_http=True):
+    def __init__(
+        self,
+        binary,
+        *,
+        reuse=True,
+        delay_ms=30,
+        timeout_ms=10000,
+        start_http=True,
+        environment=None,
+    ):
         self.stack = ExitStack()
         self.binary = str(Path(binary).resolve())
         self.tokens = {
@@ -51,8 +60,13 @@ class Sandbox:
         self.env = {
             key: value
             for key, value in os.environ.items()
-            if key in {"PATH", "SYSTEMROOT", "TMPDIR"} or key.startswith("OTEL_")
+            if key in {"PATH", "SYSTEMROOT", "TMPDIR"}
         }
+        self.env.update(
+            {key: value for key, value in os.environ.items() if key.startswith("OTEL_")}
+            if environment is None
+            else environment
+        )
         self.env.update(
             {
                 "RUST_LOG": "error",
@@ -77,6 +91,7 @@ class Sandbox:
                     self.env,
                 )
             )
+            self.peer_process = peer
             self.peer = "http://" + peer.ready["listen"]
             text = f"""listen = "127.0.0.1:0"
 admin_token_env = "AGENT_ADMIN"
@@ -152,6 +167,7 @@ arguments.deployment = {step = "deployment", pointer = "/structuredContent"}
                 gateway = self.stack.enter_context(
                     Process([self.binary, "serve", "--config", str(self.config)], self.env)
                 )
+                self.service = gateway
                 self.base = "http://" + gateway.ready["listen"]
                 self.url = self.base + "/mcp"
         except BaseException:

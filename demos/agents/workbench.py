@@ -244,13 +244,16 @@ class Workbench:
             self.active -= 1
             self.events.append({"tool": name, "start_ns": started, "end_ns": time.monotonic_ns()})
 
-    def snapshot(self):
-        return {
+    def snapshot(self, summary=False):
+        result = {
             "calls": dict(self.calls),
-            "notes": deepcopy(self.notes),
-            "events": list(self.events),
+            "note_count": len(self.notes),
+            "active": self.active,
             "peak_active": self.peak,
         }
+        if not summary:
+            result.update(notes=deepcopy(self.notes), events=list(self.events))
+        return result
 
     def control(self, value):
         service = value.get("service", "checkout")
@@ -298,7 +301,9 @@ async def main(args):
         ):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
         if request.method == "GET":
-            return JSONResponse(workbench.snapshot())
+            return JSONResponse(
+                workbench.snapshot(summary=request.query_params.get("summary") == "1")
+            )
         if len(await request.body()) > 4096:
             return JSONResponse({"error": "body too large"}, status_code=413)
         try:
