@@ -12,6 +12,15 @@ from agents.sandbox import Sandbox, connect
 from mcp.shared.exceptions import MCPError
 from mcp_demo import Client, http
 
+CASES = [
+    "mutation_during_read",
+    "revocation_during_graph",
+    "read_error",
+    "deadline_in_graph",
+    "cancel_before_write",
+    "cancel_after_write",
+]
+
 
 async def control(sandbox, path, body=None):
     status, _, result = await asyncio.to_thread(
@@ -85,18 +94,11 @@ async def failed(task, expected):
 
 async def qualification(args):
     results = []
-    for case in [
-        "mutation_during_read",
-        "revocation_during_graph",
-        "read_error",
-        "deadline_in_graph",
-        "cancel_before_write",
-        "cancel_after_write",
-    ]:
+    for case in args.case or CASES:
         with Sandbox(
             args.binary,
-            delay_ms=120,
-            timeout_ms=250 if case == "deadline_in_graph" else 10000,
+            delay_ms=500 if case == "deadline_in_graph" else 120,
+            timeout_ms=1000 if case == "deadline_in_graph" else 10000,
             environment={},
         ) as sandbox:
             observed_codes = []
@@ -210,6 +212,13 @@ async def qualification(args):
                 json.dumps({"agent_fault": case, "iterations": args.iterations, "passed": True}),
                 flush=True,
             )
+    if args.case:
+        return {
+            "status": "passed",
+            "iterations_per_case": args.iterations,
+            "checks": results,
+            "model_calls": 0,
+        }
     with Sandbox(args.binary, environment={}) as sandbox:
 
         class ChangedAfterGraph(TaggedPolicy):
@@ -286,6 +295,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary")
     parser.add_argument("--iterations", type=int, default=10)
+    parser.add_argument(
+        "--case", choices=CASES, action="append", help="Run only the selected fault case(s)"
+    )
     parser.add_argument("--output", type=Path, default=Path("target/agent-faults.json"))
     args = parser.parse_args()
     require(1 <= args.iterations <= 100, "iterations must be 1..100")
