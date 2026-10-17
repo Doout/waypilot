@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "demos"))
-from benchmark_hr import drain, wave
+from benchmark_hr import drain
 from hr.runner import run_agent
 from hr.sandbox import Sandbox, connect
 from mcp_demo import Client, Process, http
@@ -33,8 +33,51 @@ def wait_for(predicate):
     raise AssertionError("expected learning event did not arrive")
 
 
+class PreparedClient:
+    """Correctness barrier: wait for a dispatched prediction, including over stdio.
+
+    Benchmarks use the ordinary SDK client and never wait at this barrier.
+    """
+
+    def __init__(self, client, sandbox):
+        self.client, self.sandbox = client, sandbox
+
+    async def call_tool(self, *args, **kwargs):
+        result = await self.client.call_tool(*args, **kwargs)
+        value = result.model_dump(by_alias=True)
+        predicted = value.get("_meta", {}).get("io.waypilot/runtime", {}).get("predicted_tool")
+        if predicted:
+            employee = value["structuredContent"]["employee_id"]
+            await asyncio.to_thread(
+                wait_for,
+                lambda: any(
+                    e["tool"] == predicted.removeprefix("hr__")
+                    and e["employee_id"] == employee
+                    and e["phase"] == "end"
+                    for e in self.sandbox.peer_stats()["events"]
+                ),
+            )
+        return result
+
+
 def train(sandbox, start=1, count=4, think_ms=40, wrong_every=0):
-    reports = asyncio.run(wave(sandbox, start, count, 1, think_ms, wrong_every))
+    async def run():
+        reports = []
+        for index in range(count):
+            async with connect(sandbox.url, sandbox.tokens["agent"]) as client:
+                reports.append(
+                    await run_agent(
+                        PreparedClient(client, sandbox),
+                        f"E-{start + index:06d}",
+                        kind="benefits"
+                        if wrong_every and index % wrong_every == wrong_every - 1
+                        else "leave",
+                        think_ms=think_ms,
+                    )
+                )
+        return reports
+
+    reports = asyncio.run(run())
     asyncio.run(drain(sandbox))
     return reports
 
@@ -273,7 +316,10 @@ class LearningTests(unittest.TestCase):
                 role="hr-agent",
                 transport="stdio",
             ) as client:
-                reports = [await run_agent(client, f"E-{n:06d}", think_ms=40) for n in range(1, 7)]
+                reports = [
+                    await run_agent(PreparedClient(client, sandbox), f"E-{n:06d}", think_ms=40)
+                    for n in range(1, 7)
+                ]
                 return reports
 
         with Sandbox(BINARY, learning="auto", delay_ms=60) as sandbox:

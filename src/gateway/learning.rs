@@ -37,6 +37,8 @@ struct Rule {
     reused: u64,
     unused: u64,
     retired: Option<(u64, &'static str)>,
+    retirements: u32,
+    trial_generation: u64,
     cancel: CancellationToken,
 }
 struct Sample {
@@ -98,22 +100,35 @@ pub(super) struct Trial {
     id: String,
     epoch: u64,
     baseline_us: f64,
+    generation: u64,
     finished: bool,
     pub cancel: CancellationToken,
 }
 impl Drop for Trial {
     fn drop(&mut self) {
         if !self.finished {
-            self.learner
-                .feedback(&self.id, self.epoch, false, 0.0, self.baseline_us);
+            self.learner.feedback(
+                &self.id,
+                self.epoch,
+                self.generation,
+                false,
+                0.0,
+                self.baseline_us,
+            );
         }
     }
 }
 impl Trial {
     pub fn finish(&mut self, reused: bool, wait_us: f64) {
         self.finished = true;
-        self.learner
-            .feedback(&self.id, self.epoch, reused, wait_us, self.baseline_us);
+        self.learner.feedback(
+            &self.id,
+            self.epoch,
+            self.generation,
+            reused,
+            wait_us,
+            self.baseline_us,
+        );
     }
 }
 impl Drop for Demand {
@@ -219,6 +234,18 @@ impl Rule {
             *args.pointer_mut(target)? = value.clone();
         }
         Some(args)
+    }
+    fn recovery_samples(&self, learner: &Learner) -> u64 {
+        (learner.config.recovery_samples * (1u64 << self.retirements.saturating_sub(1).min(6)))
+            .min(4096)
+    }
+    fn retire(&mut self, reason: &'static str) {
+        if self.retired.is_none() {
+            self.retirements = self.retirements.saturating_add(1);
+            self.trial_generation += 1;
+        }
+        self.retired = Some((self.observations, reason));
+        self.cancel.cancel();
     }
     fn baseline(&self) -> f64 {
         self.controls.iter().sum::<f64>() / self.controls.len().max(1) as f64
@@ -459,6 +486,9 @@ impl Learner {
                     rule.unused = 0;
                     rule.holdouts = 0;
                     rule.opportunities = 0;
+                    rule.retired = None;
+                    rule.retirements = 0;
+                    rule.trial_generation += 1;
                     // Changed provenance needs its own approval and outcome evidence.
                 }
             }
@@ -475,18 +505,15 @@ impl Learner {
             if !rule.qualified(self) {
                 rule.cancel.cancel();
                 if rule.started > 0 && rule.retired.is_none() {
-                    rule.retired = Some((
-                        rule.observations,
-                        if rule.confidence() * 100.0 < self.confidence as f64 {
-                            "low_confidence"
-                        } else {
-                            "low_expected_benefit"
-                        },
-                    ));
+                    rule.retire(if rule.confidence() * 100.0 < self.confidence as f64 {
+                        "low_confidence"
+                    } else {
+                        "low_expected_benefit"
+                    });
                 }
             }
             if rule.retired.is_some_and(|(at, _)| {
-                rule.observations.saturating_sub(at) >= self.config.recovery_samples
+                rule.observations.saturating_sub(at) >= rule.recovery_samples(self)
             }) && rule.qualified(self)
             {
                 rule.retired = None;
@@ -535,6 +562,8 @@ impl Learner {
                     reused: 0,
                     unused: 0,
                     retired: None,
+                    retirements: 0,
+                    trial_generation: 0,
                     cancel: CancellationToken::new(),
                 };
                 if !selected && matches!(outcome.disposition, "executed" | "bypassed") {
@@ -602,11 +631,20 @@ impl Learner {
             id: id.into(),
             epoch,
             baseline_us: rule.baseline(),
+            generation: rule.trial_generation,
             finished: false,
             cancel: rule.cancel.child_token(),
         })
     }
-    fn feedback(&self, id: &str, epoch: u64, reused: bool, wait_us: f64, baseline_us: f64) {
+    fn feedback(
+        &self,
+        id: &str,
+        epoch: u64,
+        generation: u64,
+        reused: bool,
+        wait_us: f64,
+        baseline_us: f64,
+    ) {
         let mut state = self.state.lock().expect("learner poisoned");
         if state.epoch != epoch {
             return;
@@ -618,6 +656,9 @@ impl Learner {
             rule.reused += 1;
         } else {
             rule.unused += 1;
+        }
+        if generation != rule.trial_generation {
+            return;
         }
         let saved_us = if reused {
             baseline_us - wait_us
@@ -642,15 +683,11 @@ impl Learner {
             if waste > self.config.max_waste_percent as f64
                 || saving < self.config.min_savings_ms as f64 * 1000.0
             {
-                rule.retired = Some((
-                    rule.observations,
-                    if waste > self.config.max_waste_percent as f64 {
-                        "waste_budget"
-                    } else {
-                        "no_wait_benefit"
-                    },
-                ));
-                rule.cancel.cancel();
+                rule.retire(if waste > self.config.max_waste_percent as f64 {
+                    "waste_budget"
+                } else {
+                    "no_wait_benefit"
+                });
             }
         }
     }
@@ -690,6 +727,7 @@ impl Learner {
                 "samples":r.samples.len(),"matches":r.samples.iter().filter(|s|s.matched).count(),
                 "confidence_percent":r.confidence()*100.0,"control_samples":r.controls.len(),
                 "baseline_mean_ms":r.baseline()/1000.0,"estimated_net_saving_ms":r.estimated_saving()/1000.0,
+                "retirements":r.retirements,"recovery_observations_required":r.recovery_samples(self),
                 "prediction_samples":r.feedback.len(),"started":r.started,"reused":r.reused,"unused":r.unused,"holdouts":r.holdouts,
                 "mean_demand_wait_ms":r.feedback.iter().filter(|f|f.reused).map(|f|f.wait_us).sum::<f64>() / r.feedback.iter().filter(|f|f.reused).count().max(1) as f64 / 1000.0,
                 "baseline_relative_net_saving_ms":r.feedback.iter().map(|f|f.saved_us).sum::<f64>()/r.feedback.len().max(1) as f64/1000.0})

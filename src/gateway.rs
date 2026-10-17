@@ -845,7 +845,7 @@ impl Gateway {
                     selected_prediction.is_some(),
                 )
             });
-            self.predict_next(
+            let predicted = self.predict_next(
                 &session,
                 name,
                 &arguments,
@@ -855,7 +855,12 @@ impl Gateway {
                 selected_prediction.is_some(),
                 learned,
             );
+            if let Some(tool) = predicted {
+                outcome.result["_meta"]["io.waypilot/runtime"]["predicted_tool"] = json!(tool);
+            }
         }
+        outcome.result["_meta"]["io.waypilot/runtime"]["elapsed_us"] =
+            json!(started.elapsed().as_micros());
         Ok(outcome.result)
     }
 

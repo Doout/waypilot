@@ -196,6 +196,11 @@ fn misses_and_no_gap_prevent_activation_and_bad_trials_retire_then_relearn() {
         trial.finish(true, 120_000.0);
     }
     assert_eq!(l.report(1)["rules"][0]["retired_reason"], "no_wait_benefit");
+    assert_eq!(l.report(1)["rules"][0]["recovery_observations_required"], 8);
+    for n in 8..12 {
+        observe(&l, n, "hr__balance", true);
+    }
+    assert_eq!(l.report(1)["rules"][0]["status"], "retired");
 }
 #[test]
 fn context_budget_is_released_and_unsupported_arguments_are_not_guessed() {
@@ -258,4 +263,21 @@ fn rejected_candidates_release_capacity_without_losing_rejection() {
     );
     assert_eq!(l.report(2)["rules"][0]["id"], id);
     assert_eq!(l.report(2)["rules"][0]["status"], "rejected");
+}
+
+#[test]
+fn late_outcomes_from_a_retired_trial_do_not_poison_recovery() {
+    let l = trained(LearningMode::Auto);
+    let id = l.report(1)["rules"][0]["id"].as_str().unwrap().to_string();
+    let late = l.start(&id, 1).unwrap();
+    for _ in 0..3 {
+        drop(l.start(&id, 1).unwrap());
+    }
+    for n in 4..8 {
+        observe(&l, n, "hr__balance", true);
+    }
+    assert_eq!(l.report(1)["rules"][0]["status"], "active");
+    drop(late);
+    assert_eq!(l.report(1)["rules"][0]["prediction_samples"], 0);
+    assert_eq!(l.report(1)["rules"][0]["unused"], 4);
 }

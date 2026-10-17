@@ -65,7 +65,7 @@ impl Cleanup {
                             stats.active.fetch_add(1, Ordering::Relaxed);
                             jobs.spawn(async move {
                                 let _guard = Completion(stats.clone());
-                                let success = tokio::time::timeout(Duration::from_secs(2), action.run()).await.unwrap_or(false);
+                                let success = tokio::time::timeout(Duration::from_secs(2), action.run()).await.unwrap_or_else(|_| { tracing::error!(phase = "deadline", "upstream cleanup failed"); false });
                                 if !success { stats.errors.fetch_add(1, Ordering::Relaxed); }
                             });
                         },
@@ -117,7 +117,14 @@ impl Action {
             success = self.client.post(self.url.clone()).headers(headers.clone())
                 .header("Accept", "application/json, text/event-stream")
                 .json(&json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":id}}))
-                .send().await.is_ok_and(|response| response.status().is_success());
+                .send().await.map_or_else(|_| { tracing::error!(phase = "cancel_transport", "upstream cleanup failed"); false }, |response| {
+                    // A session-qualified 404 means the session is already gone;
+                    // neither its request nor the session needs further cancellation.
+                    let success = response.status().is_success()
+                        || (self.session.is_some() && response.status().as_u16() == 404);
+                    if !success { tracing::error!(phase = "cancel", status = response.status().as_u16(), "upstream cleanup failed"); }
+                    success
+                });
         }
         if self.session.is_some() {
             success &= self
@@ -126,11 +133,25 @@ impl Action {
                 .headers(headers)
                 .send()
                 .await
-                .is_ok_and(|response| {
-                    response.status().is_success()
-                        || response.status().as_u16() == 404
-                        || response.status().as_u16() == 405
-                });
+                .map_or_else(
+                    |_| {
+                        tracing::error!(phase = "delete_transport", "upstream cleanup failed");
+                        false
+                    },
+                    |response| {
+                        let success = response.status().is_success()
+                            || response.status().as_u16() == 404
+                            || response.status().as_u16() == 405;
+                        if !success {
+                            tracing::error!(
+                                phase = "delete",
+                                status = response.status().as_u16(),
+                                "upstream cleanup failed"
+                            );
+                        }
+                        success
+                    },
+                );
         }
         success
     }
@@ -139,6 +160,39 @@ impl Action {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn expired_sessions_are_terminal_but_authorization_failures_are_reported() {
+        use axum::{http::StatusCode, routing::post, Router};
+        for (status, session, expected) in [
+            (StatusCode::NOT_FOUND, Some("expired".to_string()), 0),
+            (StatusCode::NOT_FOUND, None, 1),
+            (StatusCode::UNAUTHORIZED, Some("denied".to_string()), 1),
+        ] {
+            let app = Router::new().route(
+                "/mcp",
+                post(move || async move { status }).delete(move || async move { status }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let cleanup = Cleanup::new(2);
+            let worker = cleanup.start();
+            cleanup.enqueue(Action {
+                client: Client::builder().no_proxy().build().unwrap(),
+                url: format!("http://{address}/mcp").parse().unwrap(),
+                headers: HeaderMap::new(),
+                session,
+                version: "2025-11-25".into(),
+                request_id: Some(7),
+            });
+            assert!(cleanup.drain(Instant::now() + Duration::from_secs(2)).await);
+            assert_eq!(cleanup.stats()["errors"], expected);
+            assert_eq!(cleanup.stats()["completed"], 1);
+            assert_eq!(cleanup.stats()["pending"], 0);
+            worker.abort();
+            server.abort();
+        }
+    }
     #[tokio::test]
     async fn overflow_is_bounded_and_reported() {
         let cleanup = Cleanup::new(1);

@@ -89,7 +89,7 @@ async def drain(sandbox):
             == 0
         ):
             assert stats["observation_bytes"] == 0 and stats["cache"]["flights"] == 0
-            assert stats["cleanup"]["errors"] == stats["cleanup"]["dropped"] == 0
+            assert stats["cleanup"]["errors"] == stats["cleanup"]["dropped"] == 0, stats["cleanup"]
             return stats
         await asyncio.sleep(0.02)
     raise RuntimeError("HR resources did not drain")
@@ -161,7 +161,22 @@ async def trial(args, mode):
                 direct=mode == "direct",
             )
             elapsed = time.perf_counter() - started
-            final = await drain(sandbox)
+            try:
+                final = await drain(sandbox)
+            except BaseException:
+                sandbox.service.log.flush()
+                sandbox.service.log.seek(0)
+                failure = {
+                    "mode": mode,
+                    "gateway": sandbox.stats(),
+                    "learned": sandbox.predictions() if not baseline else None,
+                    "upstream": sandbox.peer_stats(),
+                    "gateway_log": sandbox.service.log.read(),
+                }
+                args.output.with_suffix(".failure.json").write_text(
+                    json.dumps(failure, indent=2) + "\n"
+                )
+                raise
         finally:
             stop.set()
             await sampler

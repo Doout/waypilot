@@ -31,7 +31,10 @@ max_waste_percent = 25
   with poor recent confidence, wait reduction, or excessive unused predictions.
 
 Approval does not override performance thresholds. Rejection remains effective in auto
-mode. Retired rules can recover after fresh successful shadow observations (16 by default).
+mode. Retired rules can recover after fresh successful shadow observations (initially 16).
+Repeated failures double this interval up to 64 times the base, capped at 4,096 observations.
+Late outcomes from an earlier trial remain in lifetime work counts but cannot retire a
+recovered trial.
 One randomly placed opportunity in each block of five stays unspeculated to refresh the
 baseline without synchronizing with periodic branches. Defaults
 retain 32 recent observations and require eight prediction outcomes before applying the
@@ -77,6 +80,8 @@ a prediction runs only while they agree; subsequent actual calls can disambiguat
 Constants, booleans/nulls, transformations, unstructured text, cross-session sequences,
 and arbitrary multi-step graphs are not inferred. Speculative completions do not train
 or trigger further predictions. Catalog identity is checked again before learned dispatch.
+The ordinary runtime response metadata includes `predicted_tool` when a prediction was
+dispatched. Correctness tests use peer events as a completion barrier; benchmarks never do.
 
 Defaults bound discovery to 64 rules globally, 32 argument leaves, eight possible source
 pointers per binding, eight levels of nesting, 16 KiB per session context, and 1 MiB of

@@ -142,9 +142,9 @@ impl Gateway {
         epoch: u64,
         selected: bool,
         learned: Option<learning::Nomination>,
-    ) {
+    ) -> Option<String> {
         let Some(config) = &self.config.speculation else {
-            return;
+            return None;
         };
         if selected && matches!(outcome.disposition, "reused" | "joined") {
             self.speculator
@@ -235,31 +235,29 @@ impl Gateway {
         drop(profiles);
         let learned_id = learned.as_ref().map(|n| (n.id.clone(), n.revision.clone()));
         let candidate = learned.map(|n| (n.tool, n.arguments)).or(candidate);
-        let Some((tool, arguments)) = candidate else {
-            return;
-        };
+        let (tool, arguments) = candidate?;
         if self.authorize(session, &tool, epoch).is_err()
             || self.draining.load(Ordering::Acquire)
             || tokio::time::Instant::now() >= deadline
         {
-            return;
+            return None;
         }
         let Ok(slot) = self.speculator.slots.clone().try_acquire_owned() else {
             self.speculator
                 .metrics
                 .skipped
                 .fetch_add(1, Ordering::Relaxed);
-            return;
+            return None;
         };
         if self.admission.available_permits() <= 1 {
             self.speculator
                 .metrics
                 .skipped
                 .fetch_add(1, Ordering::Relaxed);
-            return;
+            return None;
         }
         let Ok(admission) = self.admission.clone().try_acquire_owned() else {
-            return;
+            return None;
         };
         let server = tool
             .split_once("__")
@@ -269,18 +267,15 @@ impl Gateway {
             self.connectors[server].clone(),
             Some(self.metrics.upstream_calls.clone()),
         ) else {
-            return;
+            return None;
         };
         let client = Arc::new(client);
         let trial = if let Some((id, _)) = &learned_id {
-            let Some(trial) = self
+            let trial = self
                 .speculator
                 .learner
                 .as_ref()
-                .and_then(|l| l.start(id, epoch))
-            else {
-                return;
-            };
+                .and_then(|l| l.start(id, epoch))?;
             Some(trial)
         } else {
             None
@@ -320,6 +315,7 @@ impl Gateway {
             .active
             .fetch_add(1, Ordering::Relaxed);
         let span = tracing::info_span!("mcp.speculate", tool = tool);
+        let predicted = tool.clone();
         tokio::spawn(
             async move {
                 let _active = Active(gateway.speculator.metrics.clone());
@@ -343,6 +339,7 @@ impl Gateway {
                 client.close().await;
             }.instrument(span),
         );
+        Some(predicted)
     }
 }
 #[cfg(test)]

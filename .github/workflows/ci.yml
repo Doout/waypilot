@@ -45,6 +45,12 @@ jobs:
             --tool-ms 40 --think-ms 30 --training-think-ms 30 --training-runs 6 --rounds 1 \
             --mode direct --mode learn_observe --mode learn_approval --mode learn_auto \
             --output target/learning-benchmark.json
+      - name: Qualify learned rules at 1,000 agents
+        if: runner.os == 'Linux'
+        run: |
+          python3 scripts/benchmark_hr.py target/release/waypilot --runs 1000 --concurrency 500 \
+            --tool-ms 10 --think-ms 20 --training-think-ms 20 --training-runs 8 --rounds 1 \
+            --mode learn_auto --output target/learning-scale.json
       - name: State validation benchmark controls
         run: |
           export WAYPILOT_PYTHON="$(command -v python3)"
@@ -87,6 +93,8 @@ jobs:
             target/latency-benchmark.json
             target/hr-benchmark.json
             target/learning-benchmark.json
+            target/learning-scale.json
+            target/*.failure.json
             target/observation-scale-smoke.json
             target/observation-scale.json
             target/agent-soak-smoke/*.json
