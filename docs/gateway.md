@@ -198,7 +198,7 @@ Byte budgets exclude decoded JSON, responses and allocator overhead. Readers may
 
 Idle maintenance runs every 250 ms and preserves active work. SIGINT/SIGTERM makes `/healthz` return 503, rejects new work and allows the configured shutdown grace. The service then cancels sessions, allows up to three more seconds for preparation/cleanup and stops network reads and writes. Stdio EOF and input errors also trigger cleanup. Readiness returns 200 otherwise; it does not probe upstream health.
 
-HTTP cleanup queues cancellation and DELETE for known sessions. At most 32 cleanup actions run at once, each with a two-second timeout. `/admin/stats` reports pending work, errors and drops. An abandoned initialization keeps its preparation deadline so it can receive and delete the session ID. If the server never returns that ID, its own expiry policy must reclaim the session. DELETE 405 is tolerated. Stdio cancellation invalidates its process.
+HTTP cleanup queues cancellation and DELETE for known sessions. At most 32 cleanup actions run at once, each with a two-second timeout. A transport failure during DELETE gets one retry within that same timeout; `delete_retries` and `delete_recovered` distinguish recovered failures from cleanup errors. `/admin/stats` also reports pending work and drops. An abandoned initialization keeps its preparation deadline so it can receive and delete the session ID. If the server never returns that ID, its own expiry policy must reclaim the session. DELETE 405 is tolerated. Stdio cancellation invalidates its process.
 
 Cleanup is best effort. Remote effects can finish after local cancellation. A failed invocation is never replayed or rolled back; a later distinct invocation may open a fresh session.
 
