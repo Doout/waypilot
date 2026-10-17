@@ -12,7 +12,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -31,7 +31,7 @@ jobs:
         run: |
           cargo build --locked --release
           python3 scripts/benchmark_hr.py target/release/waypilot --runs 1000 --concurrency 500 \
-            --tool-ms 10 --think-ms 20 --training-think-ms 20 --training-runs 8 --rounds 1 \
+            --tool-ms 10 --think-ms 20 --training-think-ms 20 --training-runs 8 --rounds 3 \
             --mode learn_auto --output target/learning-scale.json
       - name: Fixture benchmark
         run: |

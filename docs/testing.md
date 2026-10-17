@@ -6,6 +6,10 @@ Follow the [README](../README.md#test-and-benchmark) to install test dependencie
 
 CI runs on Linux and macOS. Linux also runs the 1,000-client/500-call release test. Artifacts include `scale-smoke.json`, `benchmark.json`, `gateway-benchmark.json` and `mcp-demo.json`, plus Linux `scale-qualification.json`. Reports upload on failure too.
 
+Linux repeats automatic pattern learning in three fresh trials of 1,000 agents at
+concurrency 500. `learning-scale.json` records each trial; call or drain failures retain
+gateway counters, learned rules and peer logs in `learning-scale.failure.json`.
+
 The [incident-agent suite](agents.md#verify-and-compare) adds real multi-turn MCP callers,
 policy decisions, read-only review, state mutation and required writes. Verification
 runs its regression tests; CI also uploads `agent-demo.json` and `agent-benchmark.json`.
