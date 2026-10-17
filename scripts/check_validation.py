@@ -440,9 +440,11 @@ class ValidationTests(unittest.TestCase):
             return await original(*args, **kwargs, compiled_input_schemas=True)
 
         with patch("check_agents.run_agent", side_effect=cached):
-            GuardTests(
-                "test_whole_batch_validated_before_dispatch"
-            ).test_whole_batch_validated_before_dispatch()
+            asyncio.run(
+                GuardTests(
+                    "test_whole_batch_validated_before_dispatch"
+                ).test_whole_batch_validated_before_dispatch()
+            )
 
     def test_persistent_clients_rotate_before_receipt_capacity(self):
         from benchmark_agents import measure
