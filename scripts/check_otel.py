@@ -62,7 +62,7 @@ def main():
         hr_demo = Path(__file__).resolve().parents[1] / "demos/hr_demo.py"
         hr_process = subprocess.run([os.environ.get("WAYPILOT_SDK_PYTHON", os.environ["WAYPILOT_PYTHON"]), str(hr_demo), str(binary), "--think-ms", "20", "--tool-ms", "5"], env=environment, capture_output=True, text=True, timeout=45, check=True)
         hr_run = json.loads(hr_process.stdout)
-        assert hr_run["gateway"]["speculation"]["reused"] >= 2
+        assert hr_run["gateway"]["speculation"]["started"] >= 2
         assert hr_run["upstream"]["case_count"] == 5
         from state_support import Client, StateDemo
         private_marker = "waypilot-otel-private-argument-and-result-probe"

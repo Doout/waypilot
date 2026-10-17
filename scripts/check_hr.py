@@ -179,7 +179,8 @@ class HRTests(unittest.TestCase):
                 try:
                     before = sandbox.stats()["speculation"]["errors"]
                     call(client, "employee")
-                    wait_for(lambda: observed(sandbox, "E-000101", "start"))
+                    # Setup consumes the same budget; expiry before dispatch is valid.
+                    wait_for(lambda: sandbox.stats()["speculation"]["errors"] > before, timeout=1.5)
                     wait_for(lambda: sandbox.stats()["speculation"]["active"] == 0)
                     self.assertGreater(sandbox.stats()["speculation"]["errors"], before)
                     self.assertEqual(sandbox.peer_stats()["case_count"], 4)
@@ -308,7 +309,23 @@ class HRTests(unittest.TestCase):
             ) as client:
                 for employee in range(1, 5):
                     await run_agent(client, f"E-{employee:06d}", think_ms=0)
-                report = await run_agent(client, "E-000101", think_ms=30)
+
+                async def prepared(after):
+                    target = {"employee": "leave_balance", "leave_balance": "leave_policy"}.get(
+                        after
+                    )
+                    if target:
+                        await asyncio.to_thread(
+                            wait_for,
+                            lambda: any(
+                                event["tool"] == target
+                                and event["employee_id"] == "E-000101"
+                                and event["phase"] == "end"
+                                for event in sandbox.peer_stats()["events"]
+                            ),
+                        )
+
+                report = await run_agent(client, "E-000101", think_ms=0, on_gap=prepared)
                 reads = [
                     t
                     for t in report["timings"]
