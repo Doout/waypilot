@@ -108,12 +108,21 @@ async fn main() -> Result<()> {
             let mut url = None;
             let mut token_env = None;
             let mut action = "stats".to_string();
+            let mut rule = None;
+            let mut learning_mode = None;
             let mut user = None;
             while let Some(arg) = args.next() {
                 match arg.as_str() {
                     "--url" => url = Some(args.next().context("--url needs a base URL")?),
                     "--token-env" => {
                         token_env = Some(args.next().context("--token-env needs a variable name")?)
+                    }
+                    "--rule" => rule = Some(args.next().context("--rule needs an ID")?),
+                    "--mode" => {
+                        learning_mode = Some(
+                            args.next()
+                                .context("--mode needs observe, approval or auto")?,
+                        )
                     }
                     "--action" => {
                         action = args
@@ -139,6 +148,14 @@ async fn main() -> Result<()> {
                 .build()?;
             let request = match action.as_str() {
                 "stats" => client.get(format!("{}/admin/stats", base.trim_end_matches('/'))),
+                "predictions" => client.get(format!("{}/admin/predictions", base.trim_end_matches('/'))),
+                "approve" | "reject" => client.post(format!("{}/admin/predictions/update", base.trim_end_matches('/')))
+                    .json(&json!({"id":rule.context("provide --rule")?,"approved":action == "approve"})),
+                "learning-mode" => {
+                    let mode = learning_mode.context("provide --mode")?;
+                    ensure!(["observe", "approval", "auto"].contains(&mode.as_str()), "invalid learning mode");
+                    client.post(format!("{}/admin/predictions/mode", base.trim_end_matches('/'))).json(&json!({"mode":mode}))
+                },
                 "users" => client.get(format!("{}/admin/users", base.trim_end_matches('/'))),
                 "invalidate" => {
                     client.post(format!("{}/admin/invalidate", base.trim_end_matches('/')))
@@ -161,7 +178,7 @@ async fn main() -> Result<()> {
             Ok(())
         }
         _ => {
-            println!("Waypilot MCP runtime\n\n  serve --config FILE [--listen 127.0.0.1:7400]\n  serve-stdio --config FILE --user ID\n  list --url URL [--token-env NAME]\n  call --url URL [--token-env NAME] --tool NAME --args JSON\n  admin --url BASE --token-env NAME --action stats|users|invalidate|enable|disable [--user ID]\n  demo --python /absolute/path/python3 [--samples 5]\n\nHTTP clients use Streamable HTTP. Logs and traces go to stderr.");
+            println!("Waypilot MCP runtime\n\n  serve --config FILE [--listen 127.0.0.1:7400]\n  serve-stdio --config FILE --user ID\n  list --url URL [--token-env NAME]\n  call --url URL [--token-env NAME] --tool NAME --args JSON\n  admin --url BASE --token-env NAME --action stats|users|invalidate|enable|disable|predictions|approve|reject|learning-mode [--user ID] [--rule ID] [--mode observe|approval|auto]\n  demo --python /absolute/path/python3 [--samples 5]\n\nHTTP clients use Streamable HTTP. Logs and traces go to stderr.");
             Ok(())
         }
     }

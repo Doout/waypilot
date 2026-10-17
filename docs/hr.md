@@ -27,8 +27,9 @@ No future branch hint is sent to the gateway.
 
 ## Gateway behavior
 
-Candidate transitions and argument provenance are authored. The gateway learns their
-frequency from successful calls, separately for each principal and policy generation.
+The default `speculate` mode uses authored transitions and argument provenance. It learns
+their frequency from successful calls, separately for each principal and policy generation.
+Use `--learning approval` or `--learning auto` to [discover those patterns automatically](learning.md).
 The HR configuration requires three observations and 75% confidence before nominating
 one next read. Arguments come from the current call or its result, never a retained
 employee ID. Repeated branch misses lower confidence and stop nomination.
@@ -87,11 +88,13 @@ target/sdk-venv/bin/python scripts/benchmark_hr.py target/release/waypilot \
 target/sdk-venv/bin/python scripts/check_hr.py target/debug/waypilot
 ```
 
-Modes are direct-to-peer (`direct`), uncached forwarding (`off`), validated caching,
+Modes include automatic discovery (`learn_observe`, `learn_approval`, `learn_auto`),
+direct-to-peer (`direct`), uncached forwarding (`off`), validated caching,
 initialization/catalog prewarming, speculative reads, and speculation with batched
 validation (`speculate_batch`). `direct` bypasses Waypilot; the report asserts zero
 gateway requests. Direct and uncached forwarding omit observation receipts. The other
 modes enforce identical observation guards. Compiled schemas and resource budgets are equal.
+Training uses `--training-think-ms` (default 200 ms) so discovery observes the planning gap.
 Training employees never appear in measurement, so ordinary cache warming cannot serve
 the measured reads. All modes must match structured observations, decisions and exact
 case effects. Two rounds reverse mode order; no latency threshold is a correctness gate.
@@ -137,6 +140,6 @@ agents, two reversed rounds). Session p95 includes SDK initialization and shutdo
 
 Batching reduced physical RPCs by 19%, with the same 470 logical checks per round.
 Both lookahead modes had 58 nominations, 52 selected cache hits and six unused guesses.
-Observations and all 32 case effects matched. Frequency gates predictability; there is
-no learned cost/benefit gate yet. Run zero-pause, slower-validator, cold and miss-heavy
+Observations and all 32 case effects matched. Frequency gates predictability; these authored-rule modes have
+no learned cost/benefit gate. The separate automatic modes evaluate that gate. Run zero-pause, slower-validator, cold and miss-heavy
 controls before generalizing these warm-history measurements to a different agent or server.

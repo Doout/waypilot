@@ -36,6 +36,8 @@ class Sandbox:
         read_delays=None,
         environment=None,
         max_in_flight=64,
+        learning=None,
+        learning_options=None,
     ):
         self.binary = str(Path(binary).resolve())
         self.mode = mode
@@ -82,6 +84,7 @@ class Sandbox:
             self.peer = "http://" + self.peer_process.ready["listen"]
             text = f'''listen = "127.0.0.1:0"
 admin_token_env = "HR_ADMIN"
+{f"state_path = {json.dumps(str(directory / 'policy.json'))}" if learning else ""}
 request_timeout_ms = {timeout_ms}
 max_sessions = 2048
 max_in_flight = {max_in_flight}
@@ -94,7 +97,7 @@ id = "hr-agent"
 tenant = "hr-lab"
 token_env = "HR_AGENT"
 tools = ["hr__*"]
-speculative_tools = {json.dumps(["hr__leave_balance", "hr__leave_policy"] if grants else [])}
+speculative_tools = {json.dumps((["hr__leave_balance", "hr__leave_policy", "hr__benefit_options"] if learning else ["hr__leave_balance", "hr__leave_policy"]) if grants else [])}
 requests_per_second = {rate}
 burst = {burst}
 [[servers]]
@@ -116,20 +119,31 @@ speculative = true
 """
                     if batch_validation:
                         text += 'state_batch_tool = "state_batch"\n'
-            if mode == "speculate":
+            if mode == "speculate" or learning:
                 text += f"""[speculation]
 max_in_flight = {slots}
 min_samples = {min_samples}
 confidence_percent = {confidence}
 max_duration_ms = {duration_ms}
-[[speculation.rules]]
+"""
+                if learning:
+                    options = {"mode": learning} | (learning_options or {})
+                    text += (
+                        "[speculation.learning]\n"
+                        + "\n".join(
+                            f"{key} = {json.dumps(value)}" for key, value in options.items()
+                        )
+                        + "\n"
+                    )
+                else:
+                    text += """[[speculation.rules]]
 after = "hr__employee"
 tool = "hr__leave_balance"
-arguments.employee_id = {{result = "/structuredContent/employee_id"}}
+arguments.employee_id = {result = "/structuredContent/employee_id"}
 [[speculation.rules]]
 after = "hr__leave_balance"
 tool = "hr__leave_policy"
-arguments.employee_id = {{input = "/employee_id"}}
+arguments.employee_id = {input = "/employee_id"}
 """
             self.config = directory / "gateway.toml"
             self.config.write_text(text)
@@ -148,6 +162,19 @@ arguments.employee_id = {{input = "/employee_id"}}
 
     def mutate(self, **values):
         return http(self.peer + "/control", self.tokens["control"], values)[2]
+
+    def predictions(self):
+        return http(self.base + "/admin/predictions", self.tokens["admin"])[2]
+
+    def decide(self, rule, approved=True):
+        return http(
+            self.base + "/admin/predictions/update",
+            self.tokens["admin"],
+            {"id": rule, "approved": approved},
+        )
+
+    def learning_mode(self, mode):
+        return http(self.base + "/admin/predictions/mode", self.tokens["admin"], {"mode": mode})
 
     def stats(self):
         return http(self.base + "/admin/stats", self.tokens["admin"])[2]

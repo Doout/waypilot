@@ -9,7 +9,9 @@ The [incident-agent workbench](docs/agents.md) runs an investigator and read-onl
 through real MCP tools, with a free policy mode, optional model mode and an uncached
 benchmark baseline. [Latency experiments](docs/latency.md) compare several optimization methods. Start it with `bash scripts/agent_demo.sh` after installing the test dependencies.
 
-The [HR workload](docs/hr.md) tests learned next-read speculation during agent thinking gaps.
+The [HR workload](docs/hr.md) tests next-read speculation during agent thinking gaps.
+[Automatic learning](docs/learning.md) discovers tool sequences and parameter mappings,
+with approval or automatic activation and retirement.
 
 This is a single-node pre-release. Workflows come from TOML. Prewarming prepares servers without invoking tools.
 

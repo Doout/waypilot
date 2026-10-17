@@ -96,13 +96,23 @@ async def drain(sandbox):
 
 
 async def trial(args, mode):
+    learning = mode.removeprefix("learn_") if mode.startswith("learn_") else None
+    baseline = mode.startswith("baseline_")
+    profile = mode.removeprefix("baseline_") if baseline else mode
     with Sandbox(
-        args.binary,
-        "off" if mode == "direct" else "speculate" if mode == "speculate_batch" else mode,
+        args.baseline if baseline else args.binary,
+        "off"
+        if mode == "direct"
+        else "speculate"
+        if profile == "speculate_batch" or learning
+        else "prewarm"
+        if profile == "prewarm_batch"
+        else profile,
         args.tool_ms,
         slots=args.slots,
         environment={},
-        batch_validation=mode == "speculate_batch",
+        batch_validation=profile in ["speculate_batch", "prewarm_batch"] or learning is not None,
+        learning=learning,
         state_ms=args.state_ms,
         read_delays=dict(args.read_ms),
         duration_ms=args.prediction_ms,
@@ -110,8 +120,15 @@ async def trial(args, mode):
         timeout_ms=30000,
     ) as sandbox:
         # Disjoint employees: training does not populate measurement cache keys.
-        await wave(sandbox, 1, args.training_runs, 1, 0, direct=mode == "direct")
+        await wave(
+            sandbox, 1, args.training_runs, 1, args.training_think_ms, direct=mode == "direct"
+        )
         await drain(sandbox)
+        learned_before = sandbox.predictions() if not baseline else None
+        if learning == "approval":
+            for rule in learned_before["rules"]:
+                if rule["status"] == "pending_approval":
+                    assert sandbox.decide(rule["id"])[0] == 200
         before = sandbox.peer_stats()
         stats_before = sandbox.stats()
         gateway, peer = (
@@ -188,8 +205,13 @@ async def trial(args, mode):
             for timing in report["timings"]:
                 if timing["phase"] == "tool":
                     tool_times.setdefault(timing["tool"], []).append(timing["elapsed_ms"])
+        learned_after = sandbox.predictions() if not baseline else None
+        if learned_after is not None and learning:
+            assert learned_after["context_bytes"] == 0
         return {
             "mode": mode,
+            "learned_before": learned_before,
+            "learned_after": learned_after,
             "driver_cpu_seconds": time.process_time() - driver_started,
             "p50_ms": percentile([r["elapsed_ms"] for r in reports], 0.5),
             "p95_ms": percentile([r["elapsed_ms"] for r in reports], 0.95),
@@ -239,6 +261,8 @@ async def trial(args, mode):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary")
+    parser.add_argument("--baseline", help="Frozen binary for baseline modes")
+    parser.add_argument("--training-think-ms", type=int, default=200)
     parser.add_argument("--runs", type=int, default=32)
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--think-ms", type=int, default=200)
@@ -253,7 +277,19 @@ def main():
     parser.add_argument(
         "--mode",
         action="append",
-        choices=["direct", "off", "cache", "prewarm", "speculate", "speculate_batch"],
+        choices=[
+            "direct",
+            "off",
+            "cache",
+            "prewarm",
+            "speculate",
+            "speculate_batch",
+            "learn_observe",
+            "learn_approval",
+            "learn_auto",
+            "baseline_speculate_batch",
+            "baseline_prewarm_batch",
+        ],
     )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
@@ -268,6 +304,8 @@ def main():
         and 1 <= args.slots <= 32
         and 1 <= args.rounds <= 6
         and 0 <= args.training_runs <= 32
+        and 0 <= args.training_think_ms <= 5000
+        and (not any(mode.startswith("baseline_") for mode in (args.mode or [])) or args.baseline)
     ):
         parser.error("invalid workload bounds")
     report = {
@@ -284,10 +322,14 @@ def main():
             "direct": "Official MCP SDK connects to peer /mcp; idle gateway receives no requests; direct client caps active tools/call at 64",
             "guards": "Direct and off have no observation receipts; other modes enforce state-v1 and receipt guards",
             "latency": "p50/p95/p99 cover agent execution with think pauses; session percentiles also include SDK initialization and shutdown; completion includes client queueing",
-            "prediction": "learned next-successful-call frequency; authored argument bindings and explicit read/disclosure contracts",
+            "prediction": "speculate modes use authored bindings; learn modes discover adjacent transitions and input/result mappings; all require explicit read/disclosure contracts; learn_approval approves eligible fixture candidates after training",
+            "learning_metrics": "Rule savings are estimates against recent uncached controls; whole-agent comparisons below are the measured experiment",
         },
         "platform": platform.platform(),
         "binary_sha256": hashlib.sha256(Path(args.binary).read_bytes()).hexdigest(),
+        "baseline_sha256": hashlib.sha256(Path(args.baseline).read_bytes()).hexdigest()
+        if args.baseline
+        else None,
         "sources_sha256": {
             name: hashlib.sha256(
                 (Path(__file__).resolve().parents[1] / name).read_bytes()
@@ -313,6 +355,9 @@ def main():
                 "prewarm",
                 "speculate",
                 "speculate_batch",
+                "learn_observe",
+                "learn_approval",
+                "learn_auto",
             ]
             for mode in modes if iteration % 2 == 0 else reversed(modes):
                 result = asyncio.run(trial(args, mode))
@@ -327,7 +372,8 @@ def main():
                             **{
                                 k: v
                                 for k, v in result.items()
-                                if k not in ["final", "output_digest"]
+                                if k
+                                not in ["final", "output_digest", "learned_before", "learned_after"]
                             },
                         }
                     ),

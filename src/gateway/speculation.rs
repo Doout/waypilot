@@ -6,7 +6,8 @@ use serde_json::Map;
 #[derive(Default)]
 pub(super) struct SessionState {
     previous: Vec<(usize, Value)>,
-    epoch: u64,
+    pub(super) learning: learning::SessionLearning,
+    pub(super) epoch: u64,
     pending: Option<Pending>,
 }
 struct Pending {
@@ -15,6 +16,7 @@ struct Pending {
     cancel: CancellationToken,
     metrics: Arc<Counters>,
     selected: bool,
+    trial: Option<learning::Trial>,
 }
 impl Drop for Pending {
     fn drop(&mut self) {
@@ -24,7 +26,18 @@ impl Drop for Pending {
         }
     }
 }
-pub(super) struct Selection(CancellationToken);
+pub(super) struct Selection(CancellationToken, Option<learning::Trial>);
+impl Selection {
+    pub fn finish(&mut self, outcome: &Outcome, wait_us: f64) {
+        if let Some(trial) = &mut self.1 {
+            trial.finish(
+                outcome.result["isError"] != true
+                    && matches!(outcome.disposition, "reused" | "joined"),
+                wait_us,
+            );
+        }
+    }
+}
 impl Drop for Selection {
     fn drop(&mut self) {
         self.0.cancel();
@@ -49,11 +62,15 @@ pub(super) struct Speculator {
     slots: Arc<Semaphore>,
     profiles: Mutex<BTreeMap<String, (u64, Vec<Counts>)>>,
     metrics: Arc<Counters>,
+    pub(super) learner: Option<Arc<learning::Learner>>,
 }
 impl Speculator {
-    pub fn new(config: Option<&Speculation>) -> Self {
+    pub fn new(config: &Config, decisions: BTreeMap<String, bool>) -> Self {
         Self {
-            slots: Arc::new(Semaphore::new(config.map_or(0, |c| c.max_in_flight))),
+            slots: Arc::new(Semaphore::new(
+                config.speculation.as_ref().map_or(0, |c| c.max_in_flight),
+            )),
+            learner: learning::Learner::new(config, decisions),
             profiles: Mutex::new(BTreeMap::new()),
             metrics: Arc::default(),
         }
@@ -93,7 +110,13 @@ impl Gateway {
             .expect("speculation poisoned")
             .pending
             .take()?;
-        if pending.epoch == self.epoch.load(Ordering::Acquire) && pending.key == key(name, args) {
+        if pending.epoch == self.epoch.load(Ordering::Acquire)
+            && pending.key == key(name, args)
+            && pending
+                .trial
+                .as_ref()
+                .is_none_or(|t| !t.cancel.is_cancelled())
+        {
             pending.selected = true;
             // Do not cancel selected work: the ordinary path still performs its
             // fresh version checks and may join the bounded cache singleflight.
@@ -102,7 +125,7 @@ impl Gateway {
                 .selected
                 .fetch_add(1, Ordering::Relaxed);
             // The demand's guard cancels remaining work on completion or abort.
-            Some(Selection(pending.cancel.clone()))
+            Some(Selection(pending.cancel.clone(), pending.trial.take()))
         } else {
             None
         }
@@ -118,6 +141,7 @@ impl Gateway {
         deadline: tokio::time::Instant,
         epoch: u64,
         selected: bool,
+        learned: Option<learning::Nomination>,
     ) {
         let Some(config) = &self.config.speculation else {
             return;
@@ -209,6 +233,8 @@ impl Gateway {
             })
             .map(|(i, args)| (config.rules[*i].tool.clone(), args.clone()));
         drop(profiles);
+        let learned_id = learned.as_ref().map(|n| (n.id.clone(), n.revision.clone()));
+        let candidate = learned.map(|n| (n.tool, n.arguments)).or(candidate);
         let Some((tool, arguments)) = candidate else {
             return;
         };
@@ -246,6 +272,20 @@ impl Gateway {
             return;
         };
         let client = Arc::new(client);
+        let trial = if let Some((id, _)) = &learned_id {
+            let Some(trial) = self
+                .speculator
+                .learner
+                .as_ref()
+                .and_then(|l| l.start(id, epoch))
+            else {
+                return;
+            };
+            Some(trial)
+        } else {
+            None
+        };
+        let rule_cancel = trial.as_ref().map(|t| t.cancel.clone());
         let cancel = session.stopped.child_token();
         let isolated = Arc::new(Session {
             id: session.id.clone(),
@@ -265,6 +305,7 @@ impl Gateway {
             cancel: cancel.clone(),
             metrics: self.speculator.metrics.clone(),
             selected: false,
+            trial,
         });
         drop(state);
         let deadline = deadline
@@ -287,7 +328,14 @@ impl Gateway {
                 let result = tokio::select! {
                     biased;
                     _ = cancel.cancelled() => None,
-                    result = gateway.direct.run(gateway.clone(), isolated, tool.clone(), arguments, deadline, epoch) => Some(result),
+                    _ = async { if let Some(token) = &rule_cancel { token.cancelled().await } else { std::future::pending::<()>().await } } => None,
+                    result = async {
+                        if let Some((_, revision)) = &learned_id {
+                            let catalog = client.catalog_checked(deadline, || gateway.live(&isolated, epoch)).await.map_err(|_| Fault::denied())?;
+                            if &catalog.revision != revision { return Err(Fault::denied()); }
+                        }
+                        gateway.direct.run(gateway.clone(), isolated, tool.clone(), arguments, deadline, epoch).await
+                    } => Some(result),
                 };
                 if result.as_ref().is_some_and(|r| r.as_ref().map_or(true, |o| o.result["isError"] == true)) {
                     gateway.speculator.metrics.errors.fetch_add(1, Ordering::Relaxed);
@@ -308,6 +356,7 @@ mod tests {
             confidence_percent: 75,
             max_duration_ms: 1000,
             rules: vec![],
+            learning: None,
         };
         assert!(!eligible(
             &Counts {

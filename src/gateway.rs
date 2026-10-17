@@ -25,6 +25,7 @@ pub(crate) mod state;
 use state::{Lineage, RemoteState};
 
 mod http;
+mod learning;
 mod network;
 mod speculation;
 mod stdio;
@@ -163,6 +164,7 @@ impl Fault {
 }
 
 pub(crate) struct Outcome {
+    pub catalog_revision: String,
     pub result: Value,
     pub disposition: &'static str,
     pub elapsed_us: u128,
@@ -227,7 +229,7 @@ impl Gateway {
         }
         Ok(Arc::new(Self {
             direct: crate::workflow::Single::new(config.max_in_flight)?,
-            speculator: speculation::Speculator::new(config.speculation.as_ref()),
+            speculator: speculation::Speculator::new(&config, policy.predictions()),
             body_readers: Arc::new(Semaphore::new(config.limits.body_readers)),
             body_bytes: Arc::new(Semaphore::new(config.limits.buffered_bytes)),
             observation_bytes: Arc::new(Semaphore::new(config.limits.observation_bytes)),
@@ -590,6 +592,7 @@ impl Gateway {
             "tool completed"
         );
         Ok(Outcome {
+            catalog_revision: catalog.revision,
             result: value,
             disposition,
             elapsed_us: started.elapsed().as_micros(),
@@ -764,8 +767,9 @@ impl Gateway {
     ) -> Result<Value, Fault> {
         let started = Instant::now();
         let epoch = self.epoch.load(Ordering::Acquire);
+        let learning = self.begin_learning(&session, epoch);
         self.authorize(&session, name, epoch)?;
-        let selected_prediction = self.select_prediction(&session, name, &arguments);
+        let mut selected_prediction = self.select_prediction(&session, name, &arguments);
         let prediction_arguments = self.config.speculation.as_ref().map(|_| arguments.clone());
         let inherited = session
             .observations
@@ -829,6 +833,18 @@ impl Gateway {
         outcome.result["_meta"]["io.waypilot/runtime"] = json!({"disposition":outcome.disposition,"elapsed_us":started.elapsed().as_micros(),"generation":epoch});
         if let Some(arguments) = prediction_arguments.filter(|_| outcome.result["isError"] != true)
         {
+            if let Some(selection) = &mut selected_prediction {
+                selection.finish(&outcome, started.elapsed().as_secs_f64() * 1e6);
+            }
+            let learned = learning.and_then(|learning| {
+                learning.finish(
+                    self,
+                    name,
+                    &arguments,
+                    &outcome,
+                    selected_prediction.is_some(),
+                )
+            });
             self.predict_next(
                 &session,
                 name,
@@ -837,6 +853,7 @@ impl Gateway {
                 deadline,
                 epoch,
                 selected_prediction.is_some(),
+                learned,
             );
         }
         Ok(outcome.result)

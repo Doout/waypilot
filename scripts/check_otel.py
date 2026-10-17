@@ -64,6 +64,10 @@ def main():
         hr_run = json.loads(hr_process.stdout)
         assert hr_run["gateway"]["speculation"]["started"] >= 2
         assert hr_run["upstream"]["case_count"] == 5
+        learning_process = subprocess.run([os.environ.get("WAYPILOT_SDK_PYTHON", os.environ["WAYPILOT_PYTHON"]), str(hr_demo), str(binary), "--learning", "auto", "--think-ms", "40", "--tool-ms", "50"], env=environment, capture_output=True, text=True, timeout=45, check=True)
+        learning_run = json.loads(learning_process.stdout)
+        assert len(learning_run["learned_after_measurement"]["rules"]) == 2
+        assert learning_run["gateway"]["speculation"]["started"] >= 1
         from state_support import Client, StateDemo
         private_marker = "waypilot-otel-private-argument-and-result-probe"
         with StateDemo(binary, environment=environment) as state_demo:
@@ -80,7 +84,7 @@ def main():
         serialized_spans = json.dumps(spans)
         assert all(secret not in serialized_spans for secret in ["E-000101", private_marker, private_receipt, state_demo.token, state_demo.admin]), "arguments, results or credentials leaked into trace fields"
         names = {span["name"] for span in spans}
-        required = {"waypilot.run", "waypilot.fragment", "mcp.prewarm", "mcp.tool", "workflow.node", "gateway.http", "mcp.gateway.request", "mcp.prepare", "mcp.invoke", "mcp.state.validate", "mcp.state.validate_batch", "mcp.state.validate_set", "waypilot.cache.lookup", "mcp.speculate", "mcp.predict"}
+        required = {"waypilot.run", "waypilot.fragment", "mcp.prewarm", "mcp.tool", "workflow.node", "gateway.http", "mcp.gateway.request", "mcp.prepare", "mcp.invoke", "mcp.state.validate", "mcp.state.validate_batch", "mcp.state.validate_set", "waypilot.cache.lookup", "mcp.speculate", "mcp.predict", "mcp.learn", "mcp.learning"}
         assert required <= names, f"missing spans: {required - names}; stderr: {process.stderr[-2000:]}"
         dispositions = {
             attr["value"].get("stringValue")

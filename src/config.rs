@@ -159,7 +159,46 @@ pub struct Speculation {
     pub min_samples: u64,
     pub confidence_percent: u64,
     pub max_duration_ms: u64,
+    #[serde(default)]
     pub rules: Vec<PredictionRule>,
+    #[serde(default)]
+    pub learning: Option<Learning>,
+}
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LearningMode {
+    Observe,
+    #[default]
+    Approval,
+    Auto,
+}
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Learning {
+    pub mode: LearningMode,
+    pub max_rules: usize,
+    pub window: usize,
+    pub min_savings_ms: u64,
+    pub max_waste_percent: u64,
+    pub evaluation_samples: usize,
+    pub holdout_every: u64,
+    pub recovery_samples: u64,
+    pub context_bytes: usize,
+}
+impl Default for Learning {
+    fn default() -> Self {
+        Self {
+            mode: LearningMode::Approval,
+            max_rules: 64,
+            window: 32,
+            min_savings_ms: 10,
+            max_waste_percent: 25,
+            evaluation_samples: 8,
+            holdout_every: 5,
+            recovery_samples: 16,
+            context_bytes: 1024 * 1024,
+        }
+    }
 }
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -392,10 +431,28 @@ impl Config {
                     && (2..=1000).contains(&speculation.min_samples)
                     && (50..=100).contains(&speculation.confidence_percent)
                     && (100..=5000).contains(&speculation.max_duration_ms)
-                    && !speculation.rules.is_empty()
+                    && (!speculation.rules.is_empty() || speculation.learning.is_some())
                     && speculation.rules.len() <= 16,
                 "invalid speculation budgets"
             );
+            if let Some(learning) = &speculation.learning {
+                ensure!(
+                    speculation.rules.is_empty(),
+                    "learning and authored prediction rules must use separate configurations"
+                );
+                ensure!(
+                    (1..=256).contains(&learning.max_rules)
+                        && (4..=256).contains(&learning.window)
+                        && learning.window as u64 >= speculation.min_samples
+                        && (1..=5000).contains(&learning.min_savings_ms)
+                        && learning.max_waste_percent <= 50
+                        && (2..=learning.window).contains(&learning.evaluation_samples)
+                        && (2..=100).contains(&learning.holdout_every)
+                        && (speculation.min_samples..=1000).contains(&learning.recovery_samples)
+                        && (16384..=16 * 1024 * 1024).contains(&learning.context_bytes),
+                    "invalid learning budgets"
+                );
+            }
             for prediction in &speculation.rules {
                 let (server, name) = prediction
                     .tool

@@ -214,3 +214,6 @@ target/debug/waypilot serve --config examples/local.toml
 Spans cover ingress, MCP requests, preparation, invocation and graph nodes. Node fields separate dependency wait, scheduler wait and execution. Results include elapsed time and `executed`, `reused`, `joined` or `bypassed` under `_meta["io.waypilot/runtime"]`. Application trace fields exclude arguments, credentials and results.
 
 The exporter also supports `http/protobuf`. Incoming W3C context extraction and upstream trace propagation are unsupported. Overlapping span durations do not add up to elapsed request time.
+
+[Automatic learning](learning.md) discovers next-call transitions and parameter mappings,
+with admin approval, automatic activation/retirement, and bounded evidence.

@@ -27,6 +27,9 @@ impl Gateway {
             .route("/admin/users", get(admin_users))
             .route("/admin/users/update", post(admin_update))
             .route("/admin/invalidate", post(admin_invalidate))
+            .route("/admin/predictions", get(admin_predictions))
+            .route("/admin/predictions/update", post(admin_prediction_update))
+            .route("/admin/predictions/mode", post(admin_prediction_mode))
             .with_state(self.clone())
             .layer(DefaultBodyLimit::max(self.config.limits.request_bytes))
             .layer(axum::middleware::from_fn_with_state(
@@ -343,6 +346,65 @@ async fn admin_users(State(gateway): State<Arc<Gateway>>, headers: HeaderMap) ->
         return StatusCode::UNAUTHORIZED.into_response();
     }
     Json(json!({"users":gateway.actors.iter().map(|actor| json!({"id":actor.settings.id,"tenant":actor.settings.tenant,"enabled":actor.enabled.load(Ordering::Acquire),"tools":actor.settings.tools,"speculative_tools":actor.settings.speculative_tools,"requests_per_second":actor.settings.requests_per_second,"burst":actor.settings.burst})).collect::<Vec<_>>()})).into_response()
+}
+async fn admin_predictions(State(gateway): State<Arc<Gateway>>, headers: HeaderMap) -> Response {
+    if !admin_authorized(&gateway, &headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    match &gateway.speculator.learner {
+        Some(learner) => {
+            Json(learner.report(gateway.epoch.load(Ordering::Acquire))).into_response()
+        }
+        None => Json(json!({"mode":"disabled","rules":[]})).into_response(),
+    }
+}
+async fn admin_prediction_update(
+    State(gateway): State<Arc<Gateway>>,
+    headers: HeaderMap,
+    Json(value): Json<Value>,
+) -> Response {
+    if !admin_authorized(&gateway, &headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let (Some(id), Some(approved)) = (value["id"].as_str(), value["approved"].as_bool()) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let Some(learner) = gateway.speculator.learner.clone() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let id = id.to_owned();
+    let mut policy = gateway.policy.clone().lock_owned().await;
+    if !learner.has_rule(&id, gateway.epoch.load(Ordering::Acquire)) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    match tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
+        policy.prediction(&id, approved)?;
+        learner.decide(&id, approved);
+        Ok(json!({"id":id,"approved":approved,"persistent":policy.persistent()}))
+    })
+    .await
+    {
+        Ok(Ok(value)) => Json(value).into_response(),
+        _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+async fn admin_prediction_mode(
+    State(gateway): State<Arc<Gateway>>,
+    headers: HeaderMap,
+    Json(value): Json<Value>,
+) -> Response {
+    if !admin_authorized(&gateway, &headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let Ok(mode) = serde_json::from_value::<crate::config::LearningMode>(value["mode"].clone())
+    else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let Some(learner) = &gateway.speculator.learner else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    learner.mode(mode);
+    Json(learner.report(gateway.epoch.load(Ordering::Acquire))).into_response()
 }
 async fn admin_update(
     State(gateway): State<Arc<Gateway>>,

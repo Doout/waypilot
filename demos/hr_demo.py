@@ -14,7 +14,17 @@ async def run(args, sandbox):
     if not args.cold:
         for number in range(1, 5):
             async with connect(sandbox.url, sandbox.tokens["agent"]) as client:
-                await run_agent(client, f"E-{number:06d}", think_ms=0, guarded=args.mode != "off")
+                await run_agent(
+                    client,
+                    f"E-{number:06d}",
+                    think_ms=args.think_ms if args.learning else 0,
+                    guarded=args.mode != "off",
+                )
+    learned = sandbox.predictions()
+    if args.approve_learned:
+        for rule in learned["rules"]:
+            if rule["status"] == "pending_approval":
+                assert sandbox.decide(rule["id"])[0] == 200
     async with connect(sandbox.url, sandbox.tokens["agent"]) as client:
         report = await run_agent(
             client,
@@ -25,6 +35,8 @@ async def run(args, sandbox):
         )
     return {
         "agent": report,
+        "learned_before_measurement": learned,
+        "learned_after_measurement": sandbox.predictions(),
         "gateway": sandbox.stats(),
         "upstream": sandbox.peer_stats(),
         "model_calls": 0,
@@ -49,6 +61,12 @@ def main():
     parser.add_argument("--state-ms", type=int, default=1)
     parser.add_argument("--batch-validation", action="store_true")
     parser.add_argument("--cold", action="store_true")
+    parser.add_argument("--learning", choices=["observe", "approval", "auto"])
+    parser.add_argument(
+        "--approve-learned",
+        action="store_true",
+        help="Approve discovered candidates before the measured demo agent",
+    )
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     if not (
@@ -62,6 +80,7 @@ def main():
         args.binary,
         args.mode,
         args.tool_ms,
+        learning=args.learning,
         state_ms=args.state_ms,
         batch_validation=args.batch_validation,
         duration_ms=args.prediction_ms,
