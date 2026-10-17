@@ -397,6 +397,12 @@ impl Gateway {
                 if let Err(denied) = self.authorize(&session, name, epoch) {
                     return denied;
                 }
+                if tokio::time::Instant::now() >= deadline {
+                    return Fault {
+                        code: -32008,
+                        message: "upstream preparation deadline exceeded",
+                    };
+                }
                 tracing::warn!(
                     cause = crate::upstream::failure_kind(&error),
                     "upstream preparation failed"
@@ -604,6 +610,15 @@ impl Gateway {
             })
             .await
             .map_err(|error| {
+                if let Err(denied) = self.authorize(session, exposed, epoch) {
+                    return denied;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Fault {
+                        code: -32008,
+                        message: "upstream invocation deadline exceeded; issued effects may have completed",
+                    };
+                }
                 tracing::warn!(
                     cause = crate::upstream::failure_kind(&error),
                     server,
