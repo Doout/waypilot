@@ -143,3 +143,6 @@ agent execution. It checks exact RPC error classes, recovery, upstream dispatch 
 and cancellation after a note has already been applied. A rendezvous fixture separately
 requires both independent graph branches to arrive before either can finish; parallel
 execution does not depend on a short wall-clock overlap happening by chance.
+The fault runner also demonstrates the inter-call boundary: changing state after a graph
+returns can leave the investigator's later note based on an earlier observation. A fresh
+review detects that change; the gateway does not provide a conversation-wide commit barrier.

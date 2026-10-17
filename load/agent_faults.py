@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 
 from agent_soak import TaggedPolicy, check_report, drained, require, write_json
-from agents.runner import run_agent
+from agents.runner import Policy, run_agent
 from agents.sandbox import Sandbox, connect
 from mcp.shared.exceptions import MCPError
 from mcp_demo import Client, http
@@ -113,7 +113,9 @@ async def qualification(args):
                         )
                         observed_codes.extend(await failed(task, {-32003, -32800}))
                     elif case == "read_error":
-                        observed_codes.extend(await failed(task, {-32002}))
+                        # A stateful tool error carries no valid witness. The gateway
+                        # reports state-v1 validation failure, before graph binding.
+                        observed_codes.extend(await failed(task, {-32010}))
                     elif case == "deadline_in_graph":
                         observed_codes.extend(await failed(task, {-32008}))
                     else:
@@ -194,6 +196,47 @@ async def qualification(args):
                 json.dumps({"agent_fault": case, "iterations": args.iterations, "passed": True}),
                 flush=True,
             )
+    with Sandbox(args.binary, environment={}) as sandbox:
+
+        class ChangedAfterGraph(TaggedPolicy):
+            async def decide(self, observations, tools):
+                if len(observations) == 2:
+                    await asyncio.to_thread(sandbox.mutate, recovered=True)
+                return await super().decide(observations, tools)
+
+        async with connect(sandbox.url, sandbox.tokens["investigator"]) as client:
+            original = await run_agent(
+                client,
+                ChangedAfterGraph("INC-101", "investigator", "boundary/inter-call-change", None),
+                role="investigator",
+                capture=True,
+                owned_tools=True,
+            )
+        check_report(original, "INC-101", False, "investigator", "boundary/inter-call-change")
+        async with connect(sandbox.url, sandbox.tokens["reviewer"]) as client:
+            review = await run_agent(
+                client,
+                Policy("INC-101", "reviewer", original["summary"]),
+                role="reviewer",
+                owned_tools=True,
+            )
+        require(
+            review["summary"].startswith("Review needs_revision.")
+            and "recommend observe" in review["summary"],
+            "reviewer did not expose the inter-call snapshot boundary",
+        )
+        require((await counts(sandbox))["note_count"] == 1, "read-only review wrote a note")
+        results.append(
+            {
+                "case": "state_change_between_mcp_calls",
+                "expected_limitation_observed": True,
+                "agent_conversation_snapshot": False,
+                "prior_observation_used_for_note": original["summary"],
+                "fresh_review": review["summary"],
+                "guarantee": "validation applies to individual MCP calls and authored workflow dependencies, not an entire agent conversation",
+            }
+        )
+        await drained(sandbox)
     with Sandbox(args.binary, environment={}) as sandbox:
         client = await asyncio.to_thread(Client, sandbox.base, sandbox.tokens["investigator"])
         try:

@@ -60,13 +60,19 @@ def main():
         assert agent_run["upstream"]["calls"]["append_note"] == 2
         assert any(agent["summary"].startswith("Review agrees.") for agent in agent_run["agents"])
         from state_support import Client, StateDemo
+        private_marker = "waypilot-otel-private-argument-and-result-probe"
         with StateDemo(binary, environment=environment) as state_demo:
             client = Client(state_demo.base, state_demo.token)
             client.call("waypilot__state", {})
             client.call("waypilot__state", {})
             state_demo.mutate(key="a", touch=True)
             client.call("waypilot__state", {})
+            state_demo.mutate(key="a", value=private_marker)
+            private_result = client.call("owned__state_read", {"key": "a", "private_context": private_marker})
+            assert private_result["structuredContent"]["value"] == private_marker
             client.close()
+        serialized_spans = json.dumps(spans)
+        assert all(secret not in serialized_spans for secret in [private_marker, state_demo.token, state_demo.admin]), "arguments, results or credentials leaked into trace fields"
         names = {span["name"] for span in spans}
         required = {"waypilot.run", "waypilot.fragment", "mcp.prewarm", "mcp.tool", "workflow.node", "gateway.http", "mcp.gateway.request", "mcp.prepare", "mcp.invoke", "mcp.state.validate", "waypilot.cache.lookup"}
         assert required <= names, f"missing spans: {required - names}; stderr: {process.stderr[-2000:]}"
