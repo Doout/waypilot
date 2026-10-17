@@ -10,6 +10,7 @@ through Waypilot to an owned service containing synthetic data.
 cargo build --locked
 # Use the SDK virtualenv from docs/agents.md.
 target/sdk-venv/bin/python demos/hr_demo.py --think-ms 200 --tool-ms 250
+target/sdk-venv/bin/python demos/hr_demo.py --batch-validation
 # Branch away from the common leave path, or start without learned history.
 target/sdk-venv/bin/python demos/hr_demo.py --kind benefits
 target/sdk-venv/bin/python demos/hr_demo.py --cold
@@ -75,35 +76,49 @@ target/sdk-venv/bin/python scripts/benchmark_hr.py target/release/waypilot \
 target/sdk-venv/bin/python scripts/check_hr.py target/debug/waypilot
 ```
 
-Modes are uncached (`off`), validated caching, initialization/catalog prewarming and
-speculative reads. Only the last mode invokes tools ahead of demand. Compare the last
-three for identical observation guards. Compiled schemas and resource budgets are equal.
+Modes are direct-to-peer (`direct`), uncached forwarding (`off`), validated caching,
+initialization/catalog prewarming, speculative reads, and speculation with batched
+validation (`speculate_batch`). `direct` bypasses Waypilot; the report asserts zero
+gateway requests. Direct and uncached forwarding omit observation receipts. The other
+modes enforce identical observation guards. Compiled schemas and resource budgets are equal.
 Training employees never appear in measurement, so ordinary cache warming cannot serve
 the measured reads. All modes must match structured observations, decisions and exact
 case effects. Two rounds reverse mode order; no latency threshold is a correctness gate.
 
-Vary `--think-ms` (including zero), `--wrong-every`, `--slots`, `--concurrency` and
-`--training-runs 0`. Reports include actual agent/tool waits, p50/p95/p99, completion time
-including client admission/initialization, CPU, sampled gateway memory/descriptors,
+Vary `--think-ms` (including zero), `--state-ms` (validator delay, default 1),
+`--wrong-every`, `--slots`, `--concurrency` and `--training-runs 0`. Reports include
+agent/tool waits, p50/p95/p99, session percentiles including SDK initialization/shutdown,
+completion time including client queueing, CPU, sampled gateway memory/descriptors,
 tool RPCs and started/selected/reused/unused/skipped predictions. RPC counts cover
 `tools/call`, including validators; initialization costs remain in wall time and CPU. `reused` counts selected
 nominations followed by a cache hit/join; RPC counts establish the actual upstream work.
 After each mode, sessions, receipts, requests, speculative jobs and cleanup must drain.
+
+`speculate_batch` configures the owned peer's `state_batch_tool = "state_batch"`.
+Multiple observations at one validation barrier share a state-batch-v1 RPC, with exact
+IDs and versions for every observation. Each still consumes rate budget and requires
+validator permission. Checks before and after an effect remain separate. This extension
+requires an explicitly configured cooperative peer; an arbitrary MCP server may only
+support individual validation. Bad batch replies fail closed without fallback or replay.
 
 Gateway OTLP spans include `mcp.predict`, `mcp.speculate` and the usual preparation,
 validation, cache and invocation spans. Arguments, employee IDs, results and receipts
 stay out of trace fields. Client think/tool times are in the agent JSON report.
 
 Local measurements on 2026-10-17 (macOS ARM64, 32 agents, concurrency 4, 250 ms reads,
-20% benefits branches, four disjoint training agents, two reversed rounds):
+1 ms validators, 200 ms planning pauses, 20% benefits branches, four disjoint training
+agents, two reversed rounds). Session p95 includes SDK initialization and shutdown:
 
-| Agent pause | Prewarm p95 | Speculative p95 |
+| Mode | Session p95 | Tool/validator RPCs |
 | --- | ---: | ---: |
-| 0 ms | 807–815 ms | 818–842 ms |
-| 200 ms | 1,414–1,418 ms | 1,013–1,014 ms |
+| Direct | 1,383–1,388 ms | 122 |
+| Uncached forwarding | 1,397–1,404 ms | 122 |
+| Guarded prewarm | 1,430–1,439 ms | 482 |
+| Lookahead | 1,033–1,038 ms | 598 |
+| Lookahead with batching | 1,021–1,022 ms | 482 |
 
-At 200 ms, each round had 58 nominations, 52 selected cache hits and six unused guesses;
-tool/validator RPCs rose from 482 to 598. Observations and all 32 case effects matched.
-Frequency gates predictability; there is no learned cost/benefit gate yet. The zero-pause
-control gives no useful speedup. Run the cold and miss-heavy controls before generalizing
-these warm-history measurements to a different agent or server.
+Batching reduced physical RPCs by 19%, with the same 470 logical checks per round.
+Both lookahead modes had 58 nominations, 52 selected cache hits and six unused guesses.
+Observations and all 32 case effects matched. Frequency gates predictability; there is
+no learned cost/benefit gate yet. Run zero-pause, slower-validator, cold and miss-heavy
+controls before generalizing these warm-history measurements to a different agent or server.

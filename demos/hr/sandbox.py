@@ -31,6 +31,8 @@ class Sandbox:
         rate=10000,
         burst=10000,
         grants=True,
+        batch_validation=False,
+        state_ms=1,
         environment=None,
         max_in_flight=64,
     ):
@@ -65,6 +67,8 @@ class Sandbox:
                         str(ROOT / "demos/hr/workbench.py"),
                         "--delay-ms",
                         str(delay_ms),
+                        "--state-ms",
+                        str(state_ms),
                     ],
                     env,
                 )
@@ -104,6 +108,8 @@ cache_ttl_ms = 60000
 state_tool = "state_version"
 speculative = true
 """
+                    if batch_validation:
+                        text += 'state_batch_tool = "state_batch"\n'
             if mode == "speculate":
                 text += f"""[speculation]
 max_in_flight = {slots}

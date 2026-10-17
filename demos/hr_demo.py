@@ -40,12 +40,22 @@ def main():
     parser.add_argument("--kind", choices=["leave", "benefits"], default="leave")
     parser.add_argument("--think-ms", type=int, default=200)
     parser.add_argument("--tool-ms", type=int, default=250)
+    parser.add_argument("--state-ms", type=int, default=1)
+    parser.add_argument("--batch-validation", action="store_true")
     parser.add_argument("--cold", action="store_true")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
-    if not (0 <= args.think_ms <= 2000 and 0 <= args.tool_ms <= 1000):
+    if not (
+        0 <= args.think_ms <= 2000 and 0 <= args.tool_ms <= 1000 and 0 <= args.state_ms <= 1000
+    ):
         parser.error("invalid delay")
-    with Sandbox(args.binary, args.mode, args.tool_ms) as sandbox:
+    with Sandbox(
+        args.binary,
+        args.mode,
+        args.tool_ms,
+        state_ms=args.state_ms,
+        batch_validation=args.batch_validation,
+    ) as sandbox:
         result = asyncio.run(run(args, sandbox))
     encoded = json.dumps(result, indent=2) + "\n"
     if args.output:

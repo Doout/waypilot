@@ -54,6 +54,211 @@ def observed(sandbox, employee, phase="end"):
 
 
 class HRTests(unittest.TestCase):
+    def test_direct_benchmark_bypasses_gateway_with_the_same_agent_plan(self):
+        results = []
+        for direct in [True, False]:
+            with Sandbox(BINARY, "off", delay_ms=0) as sandbox:
+                reports = asyncio.run(wave(sandbox, 101, 2, 2, 0, direct=direct))
+                results.append([r["observations"] for r in reports])
+                self.assertEqual(sandbox.peer_stats()["case_count"], 2)
+                self.assertTrue(all(r["session_elapsed_ms"] >= r["elapsed_ms"] for r in reports))
+                if direct:
+                    self.assertEqual(sandbox.stats()["requests"], 0)
+                    self.assertEqual(sandbox.stats()["upstream_calls"], 0)
+                else:
+                    self.assertGreater(sandbox.stats()["requests"], 0)
+                asyncio.run(drain(sandbox))
+        self.assertEqual(*results)
+
+    def test_batch_reduces_rpcs_with_identical_checks_results_and_effects(self):
+        results = []
+        for batch in [False, True]:
+            with Sandbox(BINARY, "prewarm", delay_ms=0, batch_validation=batch) as sandbox:
+                reports = asyncio.run(wave(sandbox, 101, 4, 2, 0))
+                final = asyncio.run(drain(sandbox))
+                stats = sandbox.peer_stats()
+                self.assertEqual(stats["case_count"], 4)
+                results.append((reports, stats, final))
+        single, batch = results
+        self.assertEqual(
+            [r["observations"] for r in single[0]], [r["observations"] for r in batch[0]]
+        )
+        self.assertEqual(single[2]["state_checks"], batch[2]["state_checks"])
+        self.assertGreater(batch[2]["state_batches"], 0)
+        self.assertLess(sum(batch[1]["calls"].values()), sum(single[1]["calls"].values()))
+
+    def test_direct_benchmark_respects_shared_upstream_call_budget(self):
+        with Sandbox(BINARY, "off", delay_ms=10) as sandbox:
+            reports = asyncio.run(wave(sandbox, 101, 65, 65, 0, direct=True))
+            self.assertEqual(len(reports), 65)
+            self.assertEqual(sandbox.peer_stats()["case_count"], 65)
+            self.assertLessEqual(sandbox.peer_stats()["peak_active"], 64)
+            self.assertEqual(sandbox.stats()["requests"], 0)
+
+    def test_batch_guards_speculated_reads_before_the_final_write(self):
+        with Sandbox(BINARY, delay_ms=1, batch_validation=True) as sandbox:
+            train(sandbox)
+            client = Client(sandbox.base, sandbox.tokens["agent"])
+            try:
+                receipts = []
+                for tool in ["employee", "leave_balance", "leave_policy"]:
+                    result = call(client, tool, capture=True)["result"]
+                    receipts.append(result["_meta"][META]["receipt"])
+                sandbox.mutate(employee_id="E-000101", touch=True)
+                result = call(client, "record_case", require=receipts)
+                self.assertEqual(result["error"]["code"], -32010)
+                self.assertEqual(sandbox.peer_stats()["case_count"], 4)
+                self.assertGreater(sandbox.stats()["state_batches"], 0)
+                self.assertGreater(sandbox.stats()["speculation"]["selected"], 0)
+            finally:
+                client.close()
+            asyncio.run(drain(sandbox))
+
+    def test_bad_batch_blocks_write_without_single_validation_fallback(self):
+        with Sandbox(BINARY, "cache", delay_ms=0, batch_validation=True) as sandbox:
+            client = Client(sandbox.base, sandbox.tokens["agent"])
+            try:
+                receipts = [
+                    call(client, tool, capture=True)["result"]["_meta"][META]["receipt"]
+                    for tool in ["employee", "leave_balance", "leave_policy"]
+                ]
+                for mode in ["missing", "duplicate", "changed", "error"]:
+                    with self.subTest(mode=mode):
+                        sandbox.mutate(
+                            batch_mode=mode, fail_next="state_batch" if mode == "error" else None
+                        )
+                        before = sandbox.peer_stats()["calls"].copy()
+                        result = call(client, "record_case", require=receipts)
+                        after = sandbox.peer_stats()
+                        self.assertEqual(result["error"]["code"], -32010)
+                        self.assertEqual(after["case_count"], 0)
+                        self.assertNotIn("record_case", after["calls"])
+                        self.assertEqual(
+                            after["calls"].get("state_version"), before.get("state_version")
+                        )
+                        self.assertEqual(
+                            after["calls"]["state_batch"], before.get("state_batch", 0) + 1
+                        )
+                sandbox.mutate(batch_mode="reorder")
+                self.assertIn("result", call(client, "record_case", require=receipts))
+                self.assertEqual(sandbox.peer_stats()["case_count"], 1)
+            finally:
+                client.close()
+            asyncio.run(drain(sandbox))
+
+    def test_batch_mutation_and_rate_exhaustion_block_effect_dispatch(self):
+        for control in ["mutation", "rate"]:
+            with (
+                self.subTest(control=control),
+                Sandbox(
+                    BINARY,
+                    "cache",
+                    delay_ms=0,
+                    batch_validation=True,
+                    rate=1 if control == "rate" else 10000,
+                    burst=11 if control == "rate" else 10000,
+                ) as sandbox,
+            ):
+                client = Client(sandbox.base, sandbox.tokens["agent"])
+                try:
+                    receipts = [
+                        call(client, tool, capture=True)["result"]["_meta"][META]["receipt"]
+                        for tool in ["employee", "leave_balance", "leave_policy"]
+                    ]
+                    if control == "mutation":
+                        sandbox.mutate(employee_id="E-000101", days=1)
+                    result = call(client, "record_case", require=receipts)
+                    self.assertEqual(
+                        result["error"]["code"], -32010 if control == "mutation" else -32029
+                    )
+                    self.assertNotIn("record_case", sandbox.peer_stats()["calls"])
+                    self.assertEqual(sandbox.peer_stats()["case_count"], 0)
+                finally:
+                    client.close()
+                asyncio.run(drain(sandbox))
+
+    def test_held_batch_honors_revocation_cancellation_deadline_and_mutation(self):
+        for control in ["revoke", "cancel", "deadline", "mutation"]:
+            with (
+                self.subTest(control=control),
+                Sandbox(
+                    BINARY,
+                    "cache",
+                    delay_ms=0,
+                    batch_validation=True,
+                    timeout_ms=1000 if control == "deadline" else 10000,
+                ) as sandbox,
+            ):
+                client = Client(sandbox.base, sandbox.tokens["agent"])
+                try:
+                    receipts = [
+                        call(client, tool, capture=True)["result"]["_meta"][META]["receipt"]
+                        for tool in ["employee", "leave_balance", "leave_policy"]
+                    ]
+                    sandbox.mutate(hold_tool="state_batch")
+                    with ThreadPoolExecutor(max_workers=1) as pool:
+                        pending = pool.submit(
+                            client.request,
+                            "tools/call",
+                            {
+                                "name": "hr__record_case",
+                                "arguments": {
+                                    "employee_id": "E-000101",
+                                    "kind": "leave_guidance",
+                                    "days": 5,
+                                },
+                                "_meta": {META: {"require": receipts}},
+                            },
+                            99,
+                        )
+                        wait_for(
+                            lambda: any(
+                                e["tool"] == "state_batch" and e["phase"] == "start"
+                                for e in sandbox.peer_stats()["events"]
+                            )
+                        )
+                        if control == "revoke":
+                            self.assertEqual(
+                                http(
+                                    sandbox.base + "/admin/users/update",
+                                    sandbox.tokens["admin"],
+                                    {"id": "hr-agent", "enabled": False},
+                                )[0],
+                                200,
+                            )
+                        elif control == "cancel":
+                            self.assertEqual(
+                                http(
+                                    sandbox.base + "/mcp",
+                                    sandbox.tokens["agent"],
+                                    {
+                                        "jsonrpc": "2.0",
+                                        "method": "notifications/cancelled",
+                                        "params": {"requestId": 99},
+                                    },
+                                    extra=client.headers,
+                                )[0],
+                                202,
+                            )
+                        elif control == "mutation":
+                            sandbox.mutate(employee_id="E-000101", touch=True)
+                            sandbox.mutate(hold_tool=None)
+                        result = pending.result(timeout=5)
+                        self.assertIn(
+                            result["error"]["code"],
+                            {
+                                "revoke": [-32003, -32800],
+                                "cancel": [-32800],
+                                "deadline": [-32008],
+                                "mutation": [-32010],
+                            }[control],
+                        )
+                        self.assertNotIn("record_case", sandbox.peer_stats()["calls"])
+                finally:
+                    sandbox.mutate(hold_tool=None)
+                    client.close()
+                asyncio.run(drain(sandbox))
+
     def test_learns_next_read_with_current_employee_and_never_precalls_write(self):
         with Sandbox(BINARY, delay_ms=10) as sandbox:
             client = Client(sandbox.base, sandbox.tokens["agent"])

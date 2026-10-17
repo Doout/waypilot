@@ -36,12 +36,35 @@ TOOLS += [
         "Cooperative state-v1 validator.",
         {"tool": STRING, "arguments": {"type": "object"}},
     ),
+    tool(
+        "state_batch",
+        "Cooperative state-batch-v1 validator; does not execute the reads.",
+        {
+            "version": {"const": 1},
+            "observations": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 64,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": STRING,
+                        "tool": STRING,
+                        "arguments": {"type": "object"},
+                    },
+                    "required": ["id", "tool", "arguments"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+    ),
 ]
 
 
 class HR:
-    def __init__(self, delay_ms):
+    def __init__(self, delay_ms, state_ms=1):
         self.delay_ms = delay_ms
+        self.state_ms = state_ms
         self.epoch = uuid.uuid4().hex
         self.revisions = Counter()
         self.balances = {}
@@ -53,6 +76,7 @@ class HR:
         self.release = asyncio.Event()
         self.release.set()
         self.fail_next = None
+        self.batch_mode = "valid"
         self.validators = {}
         for definition in TOOLS:
             schema = definition["inputSchema"]
@@ -92,7 +116,42 @@ class HR:
                 self.fail_next = None
                 raise ValueError("injected read error")
             state = None
-            if name == "record_case":
+            if name == "state_batch":
+                if self.hold_tool == name:
+                    await self.release.wait()
+                await asyncio.sleep(self.state_ms / 1000)
+                observations = []
+                for observation in arguments["observations"]:
+                    target, query = observation["tool"], observation["arguments"]
+                    if target not in READS:
+                        raise ValueError("invalid batch state target")
+                    self.validators[target].validate(query)
+                    _, resource = self.read(target, query)
+                    observations.append(
+                        {
+                            "id": observation["id"],
+                            "state": {
+                                "version": 1,
+                                "resources": {resource: f"{self.epoch}:{self.revisions[resource]}"},
+                            },
+                        }
+                    )
+                if self.batch_mode == "missing":
+                    observations.pop()
+                elif self.batch_mode == "duplicate":
+                    observations[-1]["id"] = observations[0]["id"]
+                elif self.batch_mode == "changed":
+                    observations[0]["state"]["resources"] = {"wrong": "version"}
+                elif self.batch_mode == "reorder":
+                    observations.reverse()
+                return {
+                    "content": [],
+                    "isError": False,
+                    "_meta": {
+                        "io.waypilot/state-batch": {"version": 1, "observations": observations}
+                    },
+                }
+            elif name == "record_case":
                 if len(self.cases) >= 10000:
                     raise ValueError("case capacity")
                 value = dict(arguments, case_id=len(self.cases) + 1)
@@ -113,7 +172,7 @@ class HR:
                     value = {}
                 if self.hold_tool == name:
                     await self.release.wait()
-                await asyncio.sleep((1 if checking else self.delay_ms) / 1000)
+                await asyncio.sleep((self.state_ms if checking else self.delay_ms) / 1000)
             result = {
                 "content": [{"type": "text", "text": json.dumps(value)}],
                 "structuredContent": value,
@@ -163,6 +222,8 @@ class HR:
                 self.balances[employee] = value["days"]
         if "fail_next" in value:
             self.fail_next = value["fail_next"]
+        if "batch_mode" in value:
+            self.batch_mode = value["batch_mode"]
         return {"updated": True}
 
 
@@ -170,6 +231,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--port", type=int, default=0)
     parser.add_argument("--delay-ms", type=int, default=250)
+    parser.add_argument("--state-ms", type=int, choices=range(0, 1001), default=1)
     parser.add_argument("--stdio", action="store_true")
     args = parser.parse_args()
-    asyncio.run(main(args, HR(args.delay_ms), TOOLS, "waypilot-hr-workbench"))
+    asyncio.run(main(args, HR(args.delay_ms, args.state_ms), TOOLS, "waypilot-hr-workbench"))
