@@ -502,7 +502,7 @@ impl Learner {
                 self.config.window,
             );
             rule.observations += 1;
-            if matched && !selected && matches!(outcome.disposition, "executed" | "bypassed") {
+            if matched && !selected {
                 bounded_push(&mut rule.controls, elapsed_us, self.config.window);
             }
             if !rule.qualified(self) {
@@ -571,7 +571,7 @@ impl Learner {
                     trial_generation: 0,
                     cancel: CancellationToken::new(),
                 };
-                if !selected && matches!(outcome.disposition, "executed" | "bypassed") {
+                if !selected {
                     rule.controls.push_back(elapsed_us);
                 }
                 rule.identify(&self.fingerprint);
@@ -743,7 +743,7 @@ impl Learner {
         json!({"mode":state.mode,"generation":state.epoch,"rules":rules,"dropped_candidates":state.dropped,
             "context_bytes":self.config.context_bytes-self.bytes.available_permits(),"limits":self.config,
             "min_samples":self.min_samples,"confidence_threshold_percent":self.confidence,
-            "estimates":"Shadow estimates use observed call gaps and uncached controls. Outcome savings compare demand wait to recent controls and charge a full control cost for unused predictions; they are not a causal end-to-end speedup."})
+            "estimates":"Shadow estimates use observed call gaps and unselected demand controls, including cache hits. Outcome savings compare demand wait to recent controls and charge a full control cost for unused predictions; they are not a causal end-to-end speedup."})
     }
 }
 impl Gateway {

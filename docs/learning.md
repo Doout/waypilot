@@ -60,7 +60,9 @@ Each candidate reports its tool sequence, source pointers, recent samples/matche
 confidence, baseline mean, estimated net saving, status, and retirement reason. Once
 used, it also reports starts, reused/unused predictions, holdouts, demand wait, and
 baseline-relative net saving. Shadow estimates use the observed gap before demand,
-capped by uncached demand duration. Both gates charge an unused prediction the full
+capped by normal demand duration. Controls include cache hits when no prediction was
+selected, so an already fast cache can suppress further predictions. Selected predictions
+never train their own baseline. Both gates charge an unused prediction the full
 estimated baseline cost. These are policy estimates, not causal end-to-end savings;
 use the benchmark's separate direct and gateway trials to measure those.
 

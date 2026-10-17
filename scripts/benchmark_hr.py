@@ -338,7 +338,7 @@ def main():
             "guards": "Direct and off have no observation receipts; other modes enforce state-v1 and receipt guards",
             "latency": "p50/p95/p99 cover agent execution with think pauses; session percentiles also include SDK initialization and shutdown; completion includes client queueing",
             "prediction": "speculate modes use authored bindings; learn modes discover adjacent transitions and input/result mappings; all require explicit read/disclosure contracts; learn_approval approves eligible fixture candidates after training",
-            "learning_metrics": "Rule savings are estimates against recent uncached controls; whole-agent comparisons below are the measured experiment",
+            "learning_metrics": "Rule savings are estimates against recent unselected demand controls, including cache hits; whole-agent comparisons below are the measured experiment",
         },
         "platform": platform.platform(),
         "binary_sha256": hashlib.sha256(Path(args.binary).read_bytes()).hexdigest(),

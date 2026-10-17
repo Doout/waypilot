@@ -307,3 +307,37 @@ fn late_outcomes_from_an_evicted_rule_do_not_poison_rediscovery() {
     assert_eq!(l.report(1)["rules"][0]["prediction_samples"], 0);
     assert_eq!(l.report(1)["rules"][0]["unused"], 0);
 }
+
+#[test]
+fn unselected_cache_hits_reduce_benefit_but_predictions_do_not_train_the_baseline() {
+    let l = trained(LearningMode::Auto);
+    let id = l.report(1)["rules"][0]["id"].as_str().unwrap().to_string();
+    let trial = l.start(&id, 1).unwrap();
+    for selected in [true, false] {
+        for n in 4..36 {
+            let mut cached = outcome(n + 100);
+            cached.disposition = "reused";
+            l.observe(
+                "alice",
+                1,
+                &prior(&l, n),
+                "hr__balance",
+                &json!({"employee":{"id":n+100}}),
+                &cached,
+                60_000.0,
+                1_000.0,
+                selected,
+                true,
+            );
+        }
+        let report = l.report(1);
+        if selected {
+            assert_eq!(report["rules"][0]["baseline_mean_ms"], 100.0);
+            assert_eq!(report["rules"][0]["status"], "active");
+        } else {
+            assert_eq!(report["rules"][0]["baseline_mean_ms"], 1.0);
+            assert_eq!(report["rules"][0]["retired_reason"], "low_expected_benefit");
+            assert!(trial.cancel.is_cancelled());
+        }
+    }
+}
