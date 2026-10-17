@@ -74,7 +74,11 @@ async def wave(sandbox, start, runs, concurrency, think_ms, wrong_every=0, *, di
             report["completion_ms"] = (time.perf_counter_ns() - submitted) / 1e6
             return report
 
-    return await asyncio.gather(*(one(i) for i in range(runs)))
+    # Own every client lifetime: one failure must cancel and await its peers
+    # before the sandbox shuts down, preserving the primary error diagnostics.
+    async with asyncio.TaskGroup() as group:
+        tasks = [group.create_task(one(i)) for i in range(runs)]
+    return [task.result() for task in tasks]
 
 
 async def drain(sandbox):
@@ -161,22 +165,29 @@ async def trial(args, mode):
                 direct=mode == "direct",
             )
             elapsed = time.perf_counter() - started
-            try:
-                final = await drain(sandbox)
-            except BaseException:
-                sandbox.service.log.flush()
-                sandbox.service.log.seek(0)
-                failure = {
-                    "mode": mode,
-                    "gateway": sandbox.stats(),
-                    "learned": sandbox.predictions() if not baseline else None,
-                    "upstream": sandbox.peer_stats(),
-                    "gateway_log": sandbox.service.log.read(),
-                }
-                args.output.with_suffix(".failure.json").write_text(
-                    json.dumps(failure, indent=2) + "\n"
-                )
-                raise
+            final = await drain(sandbox)
+        except BaseException as error:
+            failure = {"mode": mode, "error": repr(error)}
+            for name, read in [
+                ("gateway", sandbox.stats),
+                ("learned", sandbox.predictions if not baseline else lambda: None),
+                ("upstream", sandbox.peer_stats),
+            ]:
+                try:
+                    failure[name] = read()
+                except Exception as snapshot_error:
+                    failure[name] = {"snapshot_error": repr(snapshot_error)}
+            for name, process in [
+                ("gateway_log", sandbox.service),
+                ("peer_log", sandbox.peer_process),
+            ]:
+                process.log.flush()
+                process.log.seek(0)
+                failure[name] = process.log.read()
+            args.output.with_suffix(".failure.json").write_text(
+                json.dumps(failure, indent=2) + "\n"
+            )
+            raise
         finally:
             stop.set()
             await sampler

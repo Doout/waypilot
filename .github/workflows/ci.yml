@@ -26,6 +26,13 @@ jobs:
         run: |
           export WAYPILOT_PYTHON="$(command -v python3)"
           bash scripts/verify.sh
+      - name: Qualify learned rules at 1,000 agents
+        if: runner.os == 'Linux'
+        run: |
+          cargo build --locked --release
+          python3 scripts/benchmark_hr.py target/release/waypilot --runs 1000 --concurrency 500 \
+            --tool-ms 10 --think-ms 20 --training-think-ms 20 --training-runs 8 --rounds 1 \
+            --mode learn_auto --output target/learning-scale.json
       - name: Fixture benchmark
         run: |
           export WAYPILOT_PYTHON="$(command -v python3)"
@@ -45,12 +52,6 @@ jobs:
             --tool-ms 40 --think-ms 30 --training-think-ms 30 --training-runs 6 --rounds 1 \
             --mode direct --mode learn_observe --mode learn_approval --mode learn_auto \
             --output target/learning-benchmark.json
-      - name: Qualify learned rules at 1,000 agents
-        if: runner.os == 'Linux'
-        run: |
-          python3 scripts/benchmark_hr.py target/release/waypilot --runs 1000 --concurrency 500 \
-            --tool-ms 10 --think-ms 20 --training-think-ms 20 --training-runs 8 --rounds 1 \
-            --mode learn_auto --output target/learning-scale.json
       - name: State validation benchmark controls
         run: |
           export WAYPILOT_PYTHON="$(command -v python3)"
