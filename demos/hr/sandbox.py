@@ -57,7 +57,7 @@ class Sandbox:
             HR_AGENT=self.tokens["agent"],
             HR_ADMIN=self.tokens["admin"],
             WORKBENCH_CONTROL_TOKEN=self.tokens["control"],
-            RUST_LOG="error",
+            RUST_LOG="error,waypilot=warn",
         )
         try:
             directory = Path(
