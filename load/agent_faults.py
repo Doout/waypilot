@@ -41,13 +41,27 @@ async def wait_call(sandbox, name, before):
 
 async def agent(sandbox, run_id):
     async with connect(sandbox.url, sandbox.tokens["investigator"]) as client:
-        return await run_agent(
-            client,
-            TaggedPolicy("INC-101", "investigator", run_id, None),
-            role="investigator",
-            capture=True,
-            owned_tools=True,
-        )
+        try:
+            return await run_agent(
+                client,
+                TaggedPolicy("INC-101", "investigator", run_id, None),
+                role="investigator",
+                capture=True,
+                owned_tools=True,
+            )
+        finally:
+            # Keep the SDK receiver alive while an issued request acknowledges
+            # cancellation. Closing it first can turn a late reply into a local
+            # BrokenResourceError instead of preserving cancellation identity.
+            until = time.monotonic() + 5
+            while time.monotonic() < until:
+                stats = await asyncio.to_thread(sandbox.stats)
+                peer = await counts(sandbox)
+                if stats["active_requests"] == 0 and peer["active"] == 0:
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                raise AssertionError("issued work did not settle before SDK teardown")
 
 
 def codes(error):
