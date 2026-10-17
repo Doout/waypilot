@@ -23,8 +23,8 @@ def train(sandbox):
     asyncio.run(drain(sandbox))
 
 
-def wait_for(predicate):
-    until = time.monotonic() + 5
+def wait_for(predicate, timeout=5):
+    until = time.monotonic() + timeout
     while time.monotonic() < until:
         if predicate():
             return
@@ -140,7 +140,10 @@ class HRTests(unittest.TestCase):
 
     def test_close_and_revocation_stop_inflight_speculation(self):
         for revoke in [False, True]:
-            with self.subTest(revoke=revoke), Sandbox(BINARY, delay_ms=1) as sandbox:
+            with (
+                self.subTest(revoke=revoke),
+                Sandbox(BINARY, delay_ms=1, duration_ms=5000) as sandbox,
+            ):
                 train(sandbox)
                 sandbox.mutate(hold_tool="leave_balance")
                 client = Client(sandbox.base, sandbox.tokens["agent"])
@@ -156,7 +159,7 @@ class HRTests(unittest.TestCase):
                         self.assertEqual(status, 200)
                     else:
                         client.close()
-                    wait_for(lambda: sandbox.stats()["speculation"]["active"] == 0)
+                    wait_for(lambda: sandbox.stats()["speculation"]["active"] == 0, timeout=3)
                     self.assertEqual(sandbox.peer_stats()["case_count"], 4)
                 finally:
                     sandbox.mutate(hold_tool=None)
@@ -186,13 +189,14 @@ class HRTests(unittest.TestCase):
                 asyncio.run(drain(sandbox))
 
     def test_cancelled_demand_cancels_its_selected_prediction(self):
-        with Sandbox(BINARY, delay_ms=1) as sandbox:
+        with Sandbox(BINARY, delay_ms=1, duration_ms=5000) as sandbox:
             train(sandbox)
             sandbox.mutate(hold_tool="leave_balance")
             client = Client(sandbox.base, sandbox.tokens["agent"])
             try:
                 call(client, "employee")
                 wait_for(lambda: observed(sandbox, "E-000101", "start"))
+                before_selected = sandbox.stats()["speculation"]["selected"]
                 with ThreadPoolExecutor(max_workers=1) as pool:
                     request = pool.submit(
                         client.request,
@@ -200,7 +204,12 @@ class HRTests(unittest.TestCase):
                         {"name": "hr__leave_balance", "arguments": {"employee_id": "E-000101"}},
                         99,
                     )
-                    wait_for(lambda: sandbox.stats()["active_requests"] == 1)
+                    wait_for(
+                        lambda: (
+                            sandbox.stats()["active_requests"] == 2
+                            and sandbox.stats()["speculation"]["selected"] > before_selected
+                        )
+                    )
                     status, _, _ = http(
                         sandbox.base + "/mcp",
                         sandbox.tokens["agent"],
@@ -213,7 +222,7 @@ class HRTests(unittest.TestCase):
                     )
                     self.assertEqual(status, 202)
                     self.assertEqual(request.result(timeout=5)["error"]["code"], -32800)
-                    wait_for(lambda: sandbox.stats()["speculation"]["active"] == 0)
+                    wait_for(lambda: sandbox.stats()["speculation"]["active"] == 0, timeout=3)
                 self.assertEqual(sandbox.peer_stats()["case_count"], 4)
             finally:
                 sandbox.mutate(hold_tool=None)
