@@ -335,8 +335,15 @@ class LearningTests(unittest.TestCase):
             )
             self.assertEqual(sandbox.peer_stats()["case_count"], 6)
 
-    def test_generation_change_resets_evidence_and_zero_gap_does_not_enable(self):
-        with Sandbox(BINARY, learning="auto", delay_ms=40) as sandbox:
+    def test_generation_change_resets_evidence_and_benefit_gate_blocks_predictions(self):
+        # Zero agent sleep still includes SDK/network scheduling. The unit suite
+        # supplies an exact zero gap; this E2E checks an explicit benefit gate.
+        with Sandbox(
+            BINARY,
+            learning="auto",
+            delay_ms=40,
+            learning_options={"min_savings_ms": 5000},
+        ) as sandbox:
             train(sandbox)
             self.assertTrue(sandbox.predictions()["rules"])
             self.assertEqual(
@@ -344,8 +351,13 @@ class LearningTests(unittest.TestCase):
             )
             self.assertEqual(sandbox.predictions()["rules"], [])
             train(sandbox, start=101, think_ms=0)
-            self.assertEqual(sandbox.stats()["speculation"]["active"], 0)
-            self.assertTrue(all(r["status"] == "learning" for r in sandbox.predictions()["rules"]))
+            self.assertEqual(sandbox.stats()["speculation"]["started"], 0)
+            self.assertTrue(
+                all(
+                    r["status"] == "learning" and r["qualification_reason"] == "expected_benefit"
+                    for r in sandbox.predictions()["rules"]
+                )
+            )
 
 
 if __name__ == "__main__":
