@@ -59,6 +59,32 @@ target/sdk-venv/bin/python load/observation_qualify.py target/release/waypilot \
   --clients 1000 --concurrency 500 --output target/observation-scale.json
 ```
 
+## Continuous HR soak
+
+For a continuous one-hour comparison with changing agent behavior:
+
+```sh
+target/sdk-venv/bin/python load/hr_soak.py target/release/waypilot \
+  --seconds 3600 --rate 2 --concurrency 128 --trace-ratio 0.1 \
+  --output-dir target/hr-soak-$(date +%Y%m%d-%H%M%S)
+```
+
+Three isolated paths run together: direct MCP, guarded reuse without prediction, and
+automatic learning from no rules. They receive identical seeded arrivals, pauses,
+aliases, branches and external balance updates, with 64 upstream slots each. Reads vary
+from a few milliseconds to three seconds; agent pauses range from zero to seven seconds.
+Leave/benefits proportions shift every ten minutes. Some callers abandon after a profile,
+request reads concurrently, reverse their order, or reread after an external update.
+This is a synthetic policy workload over real local MCP connections, without a paid LLM.
+
+The runner verifies each observation, compares per-conversation outputs across modes,
+and reconciles every case write. It records raw conversations, one-minute learning and
+resource snapshots, arrival-cohort latency, upstream work and bounded OTLP stage histograms.
+It fails on unexpected errors, effect mismatches, resource growth or incomplete cleanup.
+Output directories must be new. `--pause-scale 0.01 --seconds 18 --rate 1` provides a smoke
+check; use the default pause scale for measurements. This tests realistic pacing rather
+than the separate 1,000-connected-client/500-active-call capacity qualification.
+
 ## Forwarding overhead
 
 ```sh

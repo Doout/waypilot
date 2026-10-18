@@ -15,6 +15,9 @@ cargo build --locked
 "${WAYPILOT_SDK_PYTHON:-$WAYPILOT_PYTHON}" scripts/check_agents.py target/debug/waypilot
 "${WAYPILOT_SDK_PYTHON:-$WAYPILOT_PYTHON}" scripts/check_validation.py target/debug/waypilot
 "${WAYPILOT_SDK_PYTHON:-$WAYPILOT_PYTHON}" scripts/check_hr.py target/debug/waypilot
+"${WAYPILOT_SDK_PYTHON:-$WAYPILOT_PYTHON}" -m ruff check scripts/check_hr_soak.py
+"${WAYPILOT_SDK_PYTHON:-$WAYPILOT_PYTHON}" -m ruff format --check scripts/check_hr_soak.py
+"${WAYPILOT_SDK_PYTHON:-$WAYPILOT_PYTHON}" scripts/check_hr_soak.py
 "${WAYPILOT_SDK_PYTHON:-$WAYPILOT_PYTHON}" scripts/check_learning.py target/debug/waypilot
 "${WAYPILOT_SDK_PYTHON:-$WAYPILOT_PYTHON}" load/agent_soak.py target/debug/waypilot --seconds 8 --wave-seconds 2 --rate 2 --concurrency 4 --trace-ratio 1 --output-dir target/agent-soak-smoke
 "${WAYPILOT_SDK_PYTHON:-$WAYPILOT_PYTHON}" load/agent_faults.py target/debug/waypilot --iterations 1 --output target/agent-faults.json

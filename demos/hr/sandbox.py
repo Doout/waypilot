@@ -39,6 +39,7 @@ class Sandbox:
         upstream_calls=64,
         learning=None,
         learning_options=None,
+        peer_script=None,
     ):
         self.binary = str(Path(binary).resolve())
         self.mode = mode
@@ -68,7 +69,7 @@ class Sandbox:
                 Process(
                     [
                         sys.executable,
-                        str(ROOT / "demos/hr/workbench.py"),
+                        str(peer_script or ROOT / "demos/hr/workbench.py"),
                         "--delay-ms",
                         str(delay_ms),
                         "--state-ms",
