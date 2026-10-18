@@ -268,7 +268,9 @@ class HRTests(unittest.TestCase):
                     delay_ms=0,
                     batch_validation=True,
                     rate=1 if control == "rate" else 10000,
-                    burst=11 if control == "rate" else 10000,
+                    # Three cold pure reads use six tokens; leave fewer than
+                    # three for the pre-write observation checks.
+                    burst=8 if control == "rate" else 10000,
                 ) as sandbox,
             ):
                 client = Client(sandbox.base, sandbox.tokens["agent"])
@@ -548,7 +550,9 @@ class HRTests(unittest.TestCase):
             asyncio.run(drain(sandbox))
 
     def test_speculation_consumes_rate_budget_before_read_dispatch(self):
-        with Sandbox(BINARY, delay_ms=0, min_samples=2, rate=1, burst=16) as sandbox:
+        # Four training reads plus the trigger use ten tokens after removing
+        # redundant cold probes. The predicted read must still obtain a token.
+        with Sandbox(BINARY, delay_ms=0, min_samples=2, rate=1, burst=10) as sandbox:
             client = Client(sandbox.base, sandbox.tokens["agent"])
             try:
                 for employee in ["E-000001", "E-000002"]:

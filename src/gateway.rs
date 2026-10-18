@@ -522,7 +522,36 @@ impl Gateway {
             receipts: Vec::new(),
             states: parents.states.clone(),
         };
-        let own_state = if let Some(validator) = rule.and_then(|rule| rule.state_tool.as_ref()) {
+        // A declared effect-free read supplies an atomic result/version witness.
+        // On a confirmed cold miss, load it directly and validate that witness at
+        // release. Cached results still need a fresh probe before lookup.
+        let mut prepared_flight = None;
+        if reusable && rule.is_some_and(|rule| rule.speculative) {
+            let cache_key = key.as_ref().expect("reusable key");
+            let present = || {
+                self.cache.may_contain(cache_key).map_err(|_| Fault {
+                    code: -32603,
+                    message: "result cache unavailable",
+                })
+            };
+            if !present()? {
+                let flight = self
+                    .cache
+                    .singleflight(cache_key, deadline)
+                    .await
+                    .map_err(|_| Fault {
+                        code: -32008,
+                        message: "result wait deadline or capacity exceeded",
+                    })?;
+                self.authorize(&session, name, epoch)?;
+                if !present()? {
+                    prepared_flight = Some(flight);
+                }
+            }
+        }
+        let fresh_load = prepared_flight.is_some();
+        let mut own_state = if let Some(validator) = rule.and_then(|rule| rule.state_tool.as_ref())
+        {
             let mut state = RemoteState {
                 validator: format!("{server_id}__{validator}"),
                 tool: name.into(),
@@ -533,14 +562,16 @@ impl Gateway {
                 evidence: Evidence::default(),
                 key: key.as_ref().expect("state key").clone(),
             };
-            state.evidence = match self.probe_state(&session, &state, deadline, epoch).await {
-                Ok(evidence) => evidence,
-                Err(error) => {
-                    let _ = self.cache.invalidate(&state.key);
-                    self.metrics.state_conflicts.fetch_add(1, Ordering::Relaxed);
-                    return Err(error);
-                }
-            };
+            if !fresh_load {
+                state.evidence = match self.probe_state(&session, &state, deadline, epoch).await {
+                    Ok(evidence) => evidence,
+                    Err(error) => {
+                        let _ = self.cache.invalidate(&state.key);
+                        self.metrics.state_conflicts.fetch_add(1, Ordering::Relaxed);
+                        return Err(error);
+                    }
+                };
+            }
             Some(state)
         } else {
             None
@@ -562,22 +593,27 @@ impl Gateway {
                         })
                 })
             };
-            if let Some(hit) = lookup()? {
+            let hit = if fresh_load { None } else { lookup()? };
+            if let Some(hit) = hit {
                 self.metrics.cache_hits.fetch_add(1, Ordering::Relaxed);
                 receipt = Some(hit.dependency);
                 ((*hit.value).clone(), "reused")
             } else {
-                let _flight = self
-                    .cache
-                    .singleflight(&key, deadline)
-                    .await
-                    .map_err(|_| Fault {
-                        code: -32008,
-                        message: "result wait deadline or capacity exceeded",
-                    })?;
+                let _flight = match prepared_flight.take() {
+                    Some(flight) => flight,
+                    None => self
+                        .cache
+                        .singleflight(&key, deadline)
+                        .await
+                        .map_err(|_| Fault {
+                            code: -32008,
+                            message: "result wait deadline or capacity exceeded",
+                        })?,
+                };
                 self.authorize(&session, name, epoch)?;
                 // A follower's evidence must still be checked at the release barrier.
-                if let Some(hit) = lookup()? {
+                let hit = if fresh_load { None } else { lookup()? };
+                if let Some(hit) = hit {
                     self.metrics.cache_hits.fetch_add(1, Ordering::Relaxed);
                     receipt = Some(hit.dependency);
                     ((*hit.value).clone(), "joined")
@@ -586,8 +622,15 @@ impl Gateway {
                     let value = self
                         .call_upstream(&session, name, &client, arguments, deadline, epoch)
                         .await?;
-                    if let Some(state) = &own_state {
-                        self.check_observation(state, &value)?;
+                    if let Some(state) = &mut own_state {
+                        if fresh_load {
+                            state.evidence = state::evidence(&value).inspect_err(|_| {
+                                let _ = self.cache.invalidate(&state.key);
+                                self.metrics.state_conflicts.fetch_add(1, Ordering::Relaxed);
+                            })?;
+                        } else {
+                            self.check_observation(state, &value)?;
+                        }
                     }
                     if value["isError"] != true {
                         let bytes = serde_json::to_vec(&value)
@@ -599,7 +642,10 @@ impl Gateway {
                             bytes,
                             Duration::from_millis(rule.expect("reusable rule").cache_ttl_ms),
                             &parents.receipts,
-                            evidence,
+                            own_state
+                                .as_ref()
+                                .map(|state| state.evidence.clone())
+                                .unwrap_or_default(),
                         ) {
                             receipt = Some(retained.dependency);
                         }

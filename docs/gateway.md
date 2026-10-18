@@ -93,6 +93,12 @@ establish this contract, and an uncooperative server cannot acquire it through g
 
 Waypilot compares exact evidence before lookup, checks ancestor observations before dependent
 work, and validates all recorded observations again before the release authorization gate.
+For an explicitly effect-free, state-validated `speculative = true` read, a cold miss can
+obtain its version evidence from the read result itself. Cache absence is rechecked under
+singleflight; followers and cached hits still obtain fresh evidence before lookup. The
+new result's evidence is validated before release, and inherited observations still guard
+dependent calls and writes. This does not authorize an early call without the separate
+speculative grant.
 A changed witness invalidates the retained computation and its transitive descendants.
 Unchanged independent branches remain reusable. A recomputed parent gets a new receipt even
 if its value is identical. Unretained parents prevent descendant retention. Stale in-flight

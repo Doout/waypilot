@@ -105,6 +105,12 @@ responses encode JSON once, and response extraction moves the owned result. Vers
 receipt, authorization, deadline and rate checks remain enabled. Speculative nominations
 yield to upstream pressure; this is a load signal, not a strict priority scheduler.
 
+Declared effect-free cold reads use the atomic state evidence returned with the result,
+then validate it before release. An advisory Wayframe cache-presence query, rechecked
+under singleflight, avoids probing a version solely to discover there is no cached result.
+Cached hits and inherited observations retain fresh validation. This removes one version
+RPC per eligible cold read; tools without that explicit contract retain their prior path.
+
 Preserve the previous release before building the new one, then compare:
 
 ```sh

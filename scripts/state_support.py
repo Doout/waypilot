@@ -25,6 +25,7 @@ class StateDemo:
         upstream=None,
         upstream_calls=512,
         rate=(10000, 10000),
+        pure=False,
     ):
         self.stack = ExitStack()
         self.directory = Path(
@@ -90,6 +91,8 @@ cache_ttl_ms = {ttl}
 """
             if validated:
                 text += 'state_tool = "state_version"\n'
+            if pure:
+                text += "speculative = true\n"
             for name in ["dependency_index", "source_index"]:
                 text += f"[servers.tools.{name}]\nreusable = true\ncache_ttl_ms = {ttl}\n"
             text += """[[workflows]]

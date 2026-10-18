@@ -206,7 +206,7 @@ pub(crate) fn conflict() -> Fault {
         message: "remote state could not be validated; request was not replayed",
     }
 }
-fn evidence(value: &Value) -> Result<Evidence, Fault> {
+pub(super) fn evidence(value: &Value) -> Result<Evidence, Fault> {
     if value["isError"] == true {
         return Err(conflict());
     }
