@@ -2,3 +2,8 @@
 mcp==2.0.1
 ruff==0.17.0
 psutil==7.2.2
+# Direct imports used by the owned agent workbench and argument validation.
+jsonschema==4.26.0
+uvicorn==0.54.0
+starlette==1.8.0
+httpx2==2.13.1

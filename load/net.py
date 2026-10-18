@@ -118,7 +118,7 @@ class MCP:
         )
         assert status == 202
 
-    async def call(self, tool, arguments):
+    async def call(self, tool, arguments, *, meta=None):
         self.sequence += 1
         identity = self.sequence
         status, _, reply = await self.http.request(
@@ -127,7 +127,11 @@ class MCP:
                 "jsonrpc": "2.0",
                 "id": identity,
                 "method": "tools/call",
-                "params": {"name": tool, "arguments": arguments},
+                "params": {
+                    "name": tool,
+                    "arguments": arguments,
+                    **({"_meta": meta} if meta is not None else {}),
+                },
             },
             headers=self.headers,
         )

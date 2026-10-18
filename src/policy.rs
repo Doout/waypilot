@@ -12,6 +12,8 @@ use std::{
 struct State {
     version: u32,
     users: BTreeMap<String, bool>,
+    #[serde(default)]
+    predictions: BTreeMap<String, bool>,
 }
 pub(crate) struct Policy {
     path: Option<PathBuf>,
@@ -50,13 +52,19 @@ impl Policy {
                 "policy state must be a regular file"
             );
             ensure!(
-                std::fs::metadata(path)?.len() <= 65536,
+                std::fs::metadata(path)?.len() <= 256 * 1024,
                 "policy state exceeds limit"
             );
             let state: State =
                 serde_json::from_slice(&std::fs::read(path)?).context("invalid policy state")?;
             ensure!(
-                state.version == 1 && state.users.keys().all(|id| ids.contains(id)),
+                state.version == 1
+                    && state.users.keys().all(|id| ids.contains(id))
+                    && state.predictions.len() <= 1024
+                    && state
+                        .predictions
+                        .keys()
+                        .all(|id| id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit())),
                 "foreign policy state users/version"
             );
             state
@@ -64,6 +72,7 @@ impl Policy {
             State {
                 version: 1,
                 users: BTreeMap::new(),
+                predictions: BTreeMap::new(),
             }
         };
         if let Some(path) = &path {
@@ -81,6 +90,29 @@ impl Policy {
     pub fn persistent(&self) -> bool {
         self.path.is_some()
     }
+    pub fn predictions(&self) -> BTreeMap<String, bool> {
+        self.state.predictions.clone()
+    }
+    pub fn prediction(&mut self, id: &str, approved: bool) -> Result<()> {
+        ensure!(
+            self.state.predictions.contains_key(id) || self.state.predictions.len() < 1024,
+            "prediction decision limit reached"
+        );
+        let mut predictions = self.state.predictions.clone();
+        predictions.insert(id.into(), approved);
+        if let Some(path) = &self.path {
+            replace(
+                path,
+                &serde_json::to_vec(&State {
+                    version: 1,
+                    users: self.state.users.clone(),
+                    predictions: predictions.clone(),
+                })?,
+            )?;
+        }
+        self.state.predictions = predictions;
+        Ok(())
+    }
     pub fn set(&mut self, id: &str, enabled: bool) -> Result<()> {
         let mut users = self.state.users.clone();
         users.insert(id.into(), enabled);
@@ -88,6 +120,7 @@ impl Policy {
             let bytes = serde_json::to_vec(&State {
                 version: 1,
                 users: users.clone(),
+                predictions: self.state.predictions.clone(),
             })?;
             replace(&path, &bytes)?;
         }
@@ -141,6 +174,8 @@ mod tests {
         let users = vec!["alice".into()];
         let mut policy = Policy::load(Some(path.clone()), &users).unwrap();
         policy.set("alice", false).unwrap();
+        let prediction = "a".repeat(64);
+        policy.prediction(&prediction, false).unwrap();
         assert!(
             Policy::load(Some(path.clone()), &users).is_err(),
             "second writer acquired live policy state"
@@ -149,6 +184,13 @@ mod tests {
         assert!(!Policy::load(Some(path.clone()), &users)
             .unwrap()
             .enabled("alice", true));
+        assert_eq!(
+            Policy::load(Some(path.clone()), &users)
+                .unwrap()
+                .predictions()
+                .get(&prediction),
+            Some(&false)
+        );
         assert!(Policy::load(Some(path.clone()), &["bob".into()]).is_err());
         #[cfg(unix)]
         {
@@ -168,6 +210,8 @@ mod tests {
         std::fs::remove_dir_all(&parent).unwrap();
         std::fs::write(&parent, b"not a directory").unwrap();
         assert!(policy.set("alice", false).is_err());
+        assert!(policy.prediction(&"a".repeat(64), true).is_err());
+        assert!(policy.predictions().is_empty());
         assert!(policy.enabled("alice", true));
         std::fs::remove_dir_all(directory).unwrap();
     }

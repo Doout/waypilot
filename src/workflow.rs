@@ -80,6 +80,7 @@ struct Inputs {
 }
 #[derive(Clone)]
 struct Node {
+    catalog_revision: String,
     result: Value,
     disposition: &'static str,
     elapsed_us: u128,
@@ -206,6 +207,7 @@ impl Single {
                     .map_err(|error| fail(&call, error))?;
                 record(&call, &result.lineage)?;
                 Ok(Node {
+                    catalog_revision: result.catalog_revision,
                     lineage: result.lineage,
                     result: result.result,
                     disposition: result.disposition,
@@ -261,6 +263,7 @@ impl Single {
             .map_err(|error| failure(&call, error.error))?;
         let result = run.get(&self.output).expect("released direct result");
         Ok(Outcome {
+            catalog_revision: result.catalog_revision.clone(),
             result: result.result.clone(),
             disposition: result.disposition,
             elapsed_us: started.elapsed().as_micros(),
@@ -398,6 +401,7 @@ impl Compiled {
                         }
                         record(&inputs.call, &result.lineage)?;
                         Ok(Node {
+                            catalog_revision: result.catalog_revision,
                             lineage: result.lineage,
                             result: result.result,
                             disposition: result.disposition,
@@ -489,11 +493,20 @@ impl Compiled {
             .expect("released workflow result")
             .clone();
         let result = json!({"content":[{"type":"text","text":output.to_string()}],"structuredContent":output,"isError":false});
+        let states = call
+            .states
+            .lock()
+            .expect("workflow states poisoned")
+            .clone();
         Ok(Outcome {
+            catalog_revision: String::new(),
             result,
             disposition: "workflow",
             elapsed_us: started.elapsed().as_micros(),
-            lineage: Lineage::default(),
+            lineage: Lineage {
+                states,
+                ..Lineage::default()
+            },
         })
     }
 }

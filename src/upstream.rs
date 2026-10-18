@@ -154,7 +154,7 @@ impl Connector {
 struct Connection {
     wire: Wire,
     version: String,
-    tools: Vec<Value>,
+    tools: Arc<Vec<Value>>,
     catalog_revision: String,
     active_request: Option<u64>,
     cleanup: Option<Arc<crate::upstream_cleanup::Cleanup>>,
@@ -173,7 +173,7 @@ pub struct Client {
 
 #[derive(Clone)]
 pub struct Catalog {
-    pub tools: Vec<Value>,
+    pub tools: Arc<Vec<Value>>,
     pub revision: String,
 }
 
@@ -258,7 +258,7 @@ impl Client {
         let mut connection = Connection {
             wire,
             version: VERSIONS[0].into(),
-            tools: Vec::new(),
+            tools: Arc::new(Vec::new()),
             catalog_revision: String::new(),
             active_request: None,
             cleanup: connector.cleanup.clone(),
@@ -323,7 +323,9 @@ impl Client {
                     catalog_bytes <= MAX_MESSAGE,
                     "combined catalog exceeds byte limit"
                 );
-                connection.tools.push(tool.clone());
+                Arc::get_mut(&mut connection.tools)
+                    .expect("unshared catalog during preparation")
+                    .push(tool.clone());
                 ensure!(
                     connection.tools.len() <= 512,
                     "upstream tool catalog exceeds limit"
@@ -332,7 +334,7 @@ impl Client {
             cursor = page.get("nextCursor").filter(|v| !v.is_null()).cloned();
             if cursor.is_none() {
                 connection.catalog_revision =
-                    crate::mcp::digest(&serde_json::to_vec(&connection.tools)?);
+                    crate::mcp::digest(&serde_json::to_vec(connection.tools.as_ref())?);
                 return Ok(connection);
             }
             let next = cursor
@@ -436,7 +438,9 @@ impl Client {
         F: Fn() -> Result<()> + Send + Sync,
     {
         timeout_at(deadline, async {
+            let queued = Instant::now();
             let mut guard = self.connection.lock().await;
+            tracing::Span::current().record("queue_us", queued.elapsed().as_micros() as u64);
             ensure!(Instant::now() < deadline, "upstream deadline exceeded before admission");
             check()?;
             self.prepare(&mut guard, deadline, &check).await?;
@@ -450,9 +454,11 @@ impl Client {
             self.calls.fetch_add(1, Ordering::Relaxed);
             if let Some(meter) = &self.meter { meter.fetch_add(1, Ordering::Relaxed); }
             connection.active_request = Some(id);
+            let sent = Instant::now();
             let response = exchange(&mut connection, json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":name,"arguments":arguments}}), deadline).await;
             // A transport/protocol failure invalidates the session. Never replay this
             // invocation: it may already have caused an external effect.
+            tracing::Span::current().record("exchange_us", sent.elapsed().as_micros() as u64);
             let reply = response?;
             connection.active_request = None;
             let value = result(reply, id)?;
@@ -460,7 +466,7 @@ impl Client {
             ensure!(value.get("isError").is_none_or(Value::is_boolean) && value.get("_meta").is_none_or(Value::is_object), "invalid MCP tool result metadata");
             *guard = Some(connection);
             Ok(value)
-        }).instrument(tracing::info_span!("mcp.invoke", tool = name)).await?
+        }).instrument(tracing::info_span!("mcp.invoke", tool = name, queue_us = tracing::field::Empty, exchange_us = tracing::field::Empty)).await?
     }
 
     pub async fn close(&self) {

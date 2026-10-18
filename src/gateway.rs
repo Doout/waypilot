@@ -25,7 +25,9 @@ pub(crate) mod state;
 use state::{Lineage, RemoteState};
 
 mod http;
+mod learning;
 mod network;
+mod speculation;
 mod stdio;
 pub use stdio::serve_stdio;
 
@@ -67,7 +69,9 @@ pub(crate) struct Session {
     touched: Mutex<Instant>,
     clients: BTreeMap<String, Arc<Client>>,
     jobs: Mutex<HashMap<String, CancellationToken>>,
+    observations: Mutex<state::Observations>,
     pub stopped: CancellationToken,
+    speculation: Mutex<speculation::SessionState>,
 }
 impl Session {
     pub(crate) fn client(&self, server: &str) -> Option<Arc<Client>> {
@@ -75,6 +79,12 @@ impl Session {
     }
     fn cancel(&self) {
         self.stopped.cancel();
+        *self.speculation.lock().expect("speculation poisoned") =
+            speculation::SessionState::default();
+        self.observations
+            .lock()
+            .expect("observations poisoned")
+            .clear();
         for token in self.jobs.lock().expect("session jobs poisoned").values() {
             token.cancel();
         }
@@ -89,6 +99,7 @@ struct Metrics {
     cache_misses: AtomicU64,
     cache_bypasses: AtomicU64,
     state_checks: AtomicU64,
+    state_batches: AtomicU64,
     state_conflicts: AtomicU64,
     denied: AtomicU64,
     prewarms: AtomicU64,
@@ -123,11 +134,13 @@ pub struct Gateway {
     preparing: Arc<Semaphore>,
     body_readers: Arc<Semaphore>,
     body_bytes: Arc<Semaphore>,
+    observation_bytes: Arc<Semaphore>,
     admin_admission: Arc<Semaphore>,
     cleanup: Arc<crate::upstream_cleanup::Cleanup>,
     policy: Arc<tokio::sync::Mutex<crate::policy::Policy>>,
     draining: AtomicBool,
     network_stop: CancellationToken,
+    speculator: speculation::Speculator,
 }
 
 #[derive(Debug)]
@@ -151,6 +164,7 @@ impl Fault {
 }
 
 pub(crate) struct Outcome {
+    pub catalog_revision: String,
     pub result: Value,
     pub disposition: &'static str,
     pub elapsed_us: u128,
@@ -158,8 +172,26 @@ pub(crate) struct Outcome {
 }
 
 impl Gateway {
+    fn cache_flight_capacity(config: &Config) -> usize {
+        // A request can run several independent workflow steps. Include queued
+        // computations, not just RPCs currently holding an upstream slot.
+        let steps = config
+            .workflows
+            .iter()
+            .map(|w| w.steps.len())
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        config.max_in_flight.saturating_mul(steps).min(10_000)
+    }
+
+    fn result_cache(config: &Config) -> Result<Cache<Value>> {
+        Cache::new(512, 16 * 1024 * 1024, Self::cache_flight_capacity(config))
+    }
+
     pub fn new(config: Config) -> Result<Arc<Self>> {
         config.validate()?;
+        let cache = Self::result_cache(&config)?;
         let admin_hash = secret(&config.admin_token_env)?;
         let mut hashes = BTreeSet::from([admin_hash.clone()]);
         let policy = crate::policy::Policy::load(
@@ -215,8 +247,10 @@ impl Gateway {
         }
         Ok(Arc::new(Self {
             direct: crate::workflow::Single::new(config.max_in_flight)?,
+            speculator: speculation::Speculator::new(&config, policy.predictions()),
             body_readers: Arc::new(Semaphore::new(config.limits.body_readers)),
             body_bytes: Arc::new(Semaphore::new(config.limits.buffered_bytes)),
+            observation_bytes: Arc::new(Semaphore::new(config.limits.observation_bytes)),
             admin_admission: Arc::new(Semaphore::new(config.limits.admin_requests)),
             upstream_admission: Arc::new(Semaphore::new(config.limits.upstream_calls)),
             cleanup,
@@ -233,7 +267,7 @@ impl Gateway {
             admin_hash,
             sessions: Mutex::new(HashMap::new()),
             epoch: AtomicU64::new(1),
-            cache: Cache::new(512, 16 * 1024 * 1024, 128)?,
+            cache,
             profiles: Mutex::new(HashMap::new()),
             metrics: Metrics::default(),
             workflows,
@@ -276,8 +310,12 @@ impl Gateway {
                         .iter()
                         .find(|item| item.id == server)
                         .and_then(|item| item.tools.get(name))
-                        .and_then(|rule| rule.state_tool.as_ref())
-                        .map(|validator| actor.permits(&format!("{server}__{validator}")))
+                        .map(|rule| {
+                            [&rule.state_tool, &rule.state_batch_tool]
+                                .into_iter()
+                                .flatten()
+                                .all(|validator| actor.permits(&format!("{server}__{validator}")))
+                        })
                 })
                 .unwrap_or(true)
     }
@@ -333,7 +371,9 @@ impl Gateway {
             touched: Mutex::new(Instant::now()),
             clients,
             jobs: Mutex::new(HashMap::new()),
+            observations: Mutex::new(state::Observations::new(self.observation_bytes.clone())),
             stopped: CancellationToken::new(),
+            speculation: Mutex::new(speculation::SessionState::default()),
         });
         sessions.insert(session.id.clone(), session.clone());
         Ok(session)
@@ -397,6 +437,12 @@ impl Gateway {
                 if let Err(denied) = self.authorize(&session, name, epoch) {
                     return denied;
                 }
+                if tokio::time::Instant::now() >= deadline {
+                    return Fault {
+                        code: -32008,
+                        message: "upstream preparation deadline exceeded",
+                    };
+                }
                 tracing::warn!(
                     cause = crate::upstream::failure_kind(&error),
                     "upstream preparation failed"
@@ -450,6 +496,10 @@ impl Gateway {
         let own_state = if let Some(validator) = rule.and_then(|rule| rule.state_tool.as_ref()) {
             let mut state = RemoteState {
                 validator: format!("{server_id}__{validator}"),
+                tool: name.into(),
+                batch_validator: rule
+                    .and_then(|r| r.state_batch_tool.as_ref())
+                    .map(|batch| format!("{server_id}__{batch}")),
                 arguments: json!({"tool":tool,"arguments":arguments}),
                 evidence: Evidence::default(),
                 key: key.as_ref().expect("state key").clone(),
@@ -560,6 +610,7 @@ impl Gateway {
             "tool completed"
         );
         Ok(Outcome {
+            catalog_revision: catalog.revision,
             result: value,
             disposition,
             elapsed_us: started.elapsed().as_micros(),
@@ -604,6 +655,15 @@ impl Gateway {
             })
             .await
             .map_err(|error| {
+                if let Err(denied) = self.authorize(session, exposed, epoch) {
+                    return denied;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Fault {
+                        code: -32008,
+                        message: "upstream invocation deadline exceeded; issued effects may have completed",
+                    };
+                }
                 tracing::warn!(
                     cause = crate::upstream::failure_kind(&error),
                     server,
@@ -721,9 +781,21 @@ impl Gateway {
         name: &str,
         arguments: Value,
         deadline: tokio::time::Instant,
+        observations: state::ObservationRequest,
     ) -> Result<Value, Fault> {
+        let started = Instant::now();
         let epoch = self.epoch.load(Ordering::Acquire);
+        let learning = self.begin_learning(&session, epoch);
         self.authorize(&session, name, epoch)?;
+        let mut selected_prediction = self.select_prediction(&session, name, &arguments);
+        let prediction_arguments = self.config.speculation.as_ref().map(|_| arguments.clone());
+        let inherited = session
+            .observations
+            .lock()
+            .expect("observations poisoned")
+            .resolve(&observations.require, epoch, Instant::now())?;
+        self.validate_states(&session, &inherited, deadline, epoch)
+            .await?;
         let mut outcome = if let Some(workflow) = self.workflows.get(name) {
             if !session.actor.consume() {
                 return Err(Fault {
@@ -747,7 +819,66 @@ impl Gateway {
                 .await?
         };
         self.authorize(&session, name, epoch)?;
-        outcome.result["_meta"]["io.waypilot/runtime"] = json!({"disposition":outcome.disposition,"elapsed_us":outcome.elapsed_us,"generation":epoch});
+        // Recheck inherited observations at release as well. An upstream effect
+        // may already have happened; this is not a distributed transaction.
+        self.validate_states(&session, &inherited, deadline, epoch)
+            .await?;
+        if let Some(meta) = outcome
+            .result
+            .get_mut("_meta")
+            .and_then(Value::as_object_mut)
+        {
+            meta.remove(state::OBSERVATIONS);
+        }
+        if observations.capture {
+            for state in inherited {
+                outcome.lineage.add_state(state)?;
+            }
+            if !outcome.lineage.states.is_empty() {
+                let receipt = session
+                    .observations
+                    .lock()
+                    .expect("observations poisoned")
+                    .retain(
+                        std::mem::take(&mut outcome.lineage.states),
+                        epoch,
+                        Instant::now(),
+                    )?;
+                outcome.result["_meta"][state::OBSERVATIONS] =
+                    json!({"receipt":receipt,"ttl_ms":60000});
+            }
+        }
+        outcome.result["_meta"]["io.waypilot/runtime"] = json!({"disposition":outcome.disposition,"elapsed_us":started.elapsed().as_micros(),"generation":epoch});
+        if let Some(arguments) = prediction_arguments.filter(|_| outcome.result["isError"] != true)
+        {
+            if let Some(selection) = &mut selected_prediction {
+                selection.finish(&outcome, started.elapsed().as_secs_f64() * 1e6);
+            }
+            let learned = learning.and_then(|learning| {
+                learning.finish(
+                    self,
+                    name,
+                    &arguments,
+                    &outcome,
+                    selected_prediction.is_some(),
+                )
+            });
+            let predicted = self.predict_next(
+                &session,
+                name,
+                &arguments,
+                &outcome,
+                deadline,
+                epoch,
+                selected_prediction.is_some(),
+                learned,
+            );
+            if let Some(tool) = predicted {
+                outcome.result["_meta"]["io.waypilot/runtime"]["predicted_tool"] = json!(tool);
+            }
+        }
+        outcome.result["_meta"]["io.waypilot/runtime"]["elapsed_us"] =
+            json!(started.elapsed().as_micros());
         Ok(outcome.result)
     }
 
@@ -766,7 +897,8 @@ impl Gateway {
                     code: -32002,
                     message: "upstream tool discovery failed",
                 })?;
-            for mut tool in catalog {
+            for definition in catalog.iter() {
+                let mut tool = definition.clone();
                 let name = format!(
                     "{}__{}",
                     server,
@@ -886,7 +1018,19 @@ impl Gateway {
                     if !args.is_object() {
                         return Err(Fault::invalid());
                     }
-                    self.tool(session.clone(), name, args, deadline).await
+                    if value
+                        .pointer("/params/_meta")
+                        .is_some_and(|meta| !meta.is_object())
+                    {
+                        return Err(Fault::invalid());
+                    }
+                    let observations = state::ObservationRequest::parse(
+                        value
+                            .pointer("/params/_meta")
+                            .and_then(|meta| meta.get(state::OBSERVATIONS)),
+                    )?;
+                    self.tool(session.clone(), name, args, deadline, observations)
+                        .await
                 }
                 _ => Err(Fault {
                     code: -32601,
@@ -952,6 +1096,13 @@ impl Gateway {
             tokio::select! { _ = self.network_stop.cancelled() => break, _ = interval.tick() => {} }
             let expired = {
                 let mut sessions = self.sessions.lock().expect("sessions poisoned");
+                for session in sessions.values() {
+                    session
+                        .observations
+                        .lock()
+                        .expect("observations poisoned")
+                        .prune(self.epoch.load(Ordering::Acquire), Instant::now());
+                }
                 let ids: Vec<_> = sessions
                     .iter()
                     .filter(|(_, session)| {
@@ -983,10 +1134,14 @@ impl Gateway {
 
     fn snapshot(&self) -> Value {
         let metrics = &self.metrics;
+        let mut cache = self.cache.stats().unwrap_or(Value::Null);
+        if cache.is_object() {
+            cache["flight_capacity"] = json!(Self::cache_flight_capacity(&self.config));
+        }
         json!({"generation":self.epoch.load(Ordering::Acquire),"sessions":self.sessions.lock().expect("sessions poisoned").len(),
             "requests":metrics.requests.load(Ordering::Relaxed),"upstream_calls":metrics.upstream_calls.load(Ordering::Relaxed),
             "cache_hits":metrics.cache_hits.load(Ordering::Relaxed),"cache_misses":metrics.cache_misses.load(Ordering::Relaxed),
-            "cache_bypasses":metrics.cache_bypasses.load(Ordering::Relaxed),"state_checks":metrics.state_checks.load(Ordering::Relaxed),"state_conflicts":metrics.state_conflicts.load(Ordering::Relaxed),"denied":metrics.denied.load(Ordering::Relaxed),
+            "cache_bypasses":metrics.cache_bypasses.load(Ordering::Relaxed),"state_checks":metrics.state_checks.load(Ordering::Relaxed),"state_batches":metrics.state_batches.load(Ordering::Relaxed),"state_conflicts":metrics.state_conflicts.load(Ordering::Relaxed),"denied":metrics.denied.load(Ordering::Relaxed),
             "prewarms":metrics.prewarms.load(Ordering::Relaxed),"prewarm_errors":metrics.prewarm_errors.load(Ordering::Relaxed),
             "rejected_capacity":metrics.rejected.load(Ordering::Relaxed),"sessions_expired":metrics.expired.load(Ordering::Relaxed),
             "active_requests":self.config.max_in_flight-self.admission.available_permits(),
@@ -994,8 +1149,9 @@ impl Gateway {
             "active_initializations":self.config.limits.upstream_initializations-self.preparing.available_permits(),
             "body_readers":self.config.limits.body_readers-self.body_readers.available_permits(),
             "buffered_bytes":self.config.limits.buffered_bytes-self.body_bytes.available_permits(),
+            "observation_bytes":self.config.limits.observation_bytes-self.observation_bytes.available_permits(),
             "connections":metrics.connections.load(Ordering::Relaxed),"draining":self.draining.load(Ordering::Relaxed),
-            "cleanup":self.cleanup.stats(),"cache":self.cache.stats().unwrap_or(Value::Null)})
+            "speculation":self.speculator.stats(),"cleanup":self.cleanup.stats(),"cache":cache})
     }
 }
 
@@ -1067,4 +1223,69 @@ fn ensure_size(value: &Value) -> Result<()> {
         "message exceeds limit"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn admitted_requests_and_workflow_branches_fit_cache_flights() {
+        for (requests, branches) in [(500, 1), (100, 2)] {
+            let mut config: Config = serde_json::from_value(json!({
+                "admin_token_env":"ADMIN", "users":[], "servers":[],
+                "max_in_flight": requests,
+            }))
+            .unwrap();
+            if branches > 1 {
+                config.workflows.push(config::Workflow {
+                    name: "parallel".into(),
+                    description: "parallel reads".into(),
+                    input_schema: json!({"type":"object"}),
+                    steps: (0..branches)
+                        .map(|i| config::Step {
+                            id: format!("read-{i}"),
+                            tool: "peer__read".into(),
+                            arguments: BTreeMap::new(),
+                        })
+                        .collect(),
+                    outputs: vec![],
+                });
+            }
+            let cache = Gateway::result_cache(&config).unwrap();
+            let permissions = BTreeSet::from(["peer__read".into()]);
+            let key = |i| {
+                Key::new(
+                    Scope {
+                        tenant: "test",
+                        subject: "user",
+                        permissions: &permissions,
+                        generation: 1,
+                        route: "peer",
+                    },
+                    "tools/call",
+                    "read",
+                    &json!({"id":i}),
+                )
+                .unwrap()
+            };
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            // Keep every distinct computation pending, including parallel child
+            // work, so a fast peer cannot hide an undersized singleflight budget.
+            let mut held = Vec::new();
+            for i in 0..requests * branches {
+                held.push(cache.singleflight(&key(i), deadline).await.unwrap());
+            }
+            assert!(cache
+                .singleflight(&key(requests * branches), deadline)
+                .await
+                .is_err());
+            drop(held);
+            assert!(cache
+                .singleflight(&key(requests * branches), deadline)
+                .await
+                .is_ok());
+            assert_eq!(cache.stats().unwrap()["flights"], 0);
+        }
+    }
 }
