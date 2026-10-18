@@ -56,12 +56,15 @@ struct Counters {
     unused: AtomicU64,
     errors: AtomicU64,
     skipped: AtomicU64,
+    pressure_skipped: AtomicU64,
     active: AtomicU64,
 }
 pub(super) struct Speculator {
     slots: Arc<Semaphore>,
     profiles: Mutex<BTreeMap<String, (u64, Vec<Counts>)>>,
     metrics: Arc<Counters>,
+    clock: Instant,
+    pressure_until_us: AtomicU64,
     pub(super) learner: Option<Arc<learning::Learner>>,
 }
 impl Speculator {
@@ -73,17 +76,52 @@ impl Speculator {
             learner: learning::Learner::new(config, decisions),
             profiles: Mutex::new(BTreeMap::new()),
             metrics: Arc::default(),
+            clock: Instant::now(),
+            pressure_until_us: AtomicU64::new(0),
         }
+    }
+    pub(super) fn note_queue(&self, elapsed_us: u64) {
+        if elapsed_us >= 1000 {
+            let now = self.clock.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+            self.pressure_until_us
+                .fetch_max(now.saturating_add(100_000), Ordering::Relaxed);
+        }
+    }
+    fn pressured(&self) -> bool {
+        self.clock.elapsed().as_micros()
+            < u128::from(self.pressure_until_us.load(Ordering::Relaxed))
     }
     pub fn stats(&self) -> Value {
         let m = &self.metrics;
         json!({"started":m.started.load(Ordering::Relaxed),"selected":m.selected.load(Ordering::Relaxed),
             "reused":m.reused.load(Ordering::Relaxed),"unused":m.unused.load(Ordering::Relaxed),
             "errors":m.errors.load(Ordering::Relaxed),"skipped":m.skipped.load(Ordering::Relaxed),
+            "pressure_skipped":m.pressure_skipped.load(Ordering::Relaxed),
             "active":m.active.load(Ordering::Relaxed)})
     }
 }
 struct Active(Arc<Counters>);
+
+#[cfg(test)]
+mod pressure_tests {
+    use super::*;
+
+    #[test]
+    fn queue_pressure_has_a_bounded_refreshable_cooldown() {
+        let config: Config = toml::from_str(include_str!("../../examples/local.toml")).unwrap();
+        let mut speculator = Speculator::new(&config, BTreeMap::new());
+        speculator.note_queue(999);
+        assert!(!speculator.pressured());
+        speculator.note_queue(1000);
+        assert!(speculator.pressured());
+        let first = speculator.pressure_until_us.load(Ordering::Relaxed);
+        speculator.note_queue(1000);
+        assert!(speculator.pressure_until_us.load(Ordering::Relaxed) >= first);
+        speculator.clock -= Duration::from_millis(200);
+        assert!(!speculator.pressured());
+    }
+}
+
 impl Drop for Active {
     fn drop(&mut self) {
         self.0.active.fetch_sub(1, Ordering::Relaxed);
@@ -242,6 +280,38 @@ impl Gateway {
         {
             return None;
         }
+        let server = tool
+            .split_once("__")
+            .expect("configured prediction prefix")
+            .0;
+        let server_limit = self
+            .config
+            .servers
+            .iter()
+            .find(|s| s.id == server)
+            .expect("configured prediction server")
+            .max_in_flight;
+        // Defer nominations with less than a quarter of either call budget free,
+        // or when shared calls/preparation are saturated. This is a pressure
+        // signal; the ordinary admission limits still bound every dispatch.
+        let reserve = |limit: usize| limit.div_ceil(4).min(limit.saturating_sub(1));
+        if self.speculator.pressured()
+            || self.metrics.upstream_waiters.load(Ordering::Relaxed) > 0
+            || self.upstream_admission.available_permits()
+                <= reserve(self.config.limits.upstream_calls)
+            || self.server_admission[server].available_permits() <= reserve(server_limit)
+            || self.preparing.available_permits() == 0
+        {
+            self.speculator
+                .metrics
+                .skipped
+                .fetch_add(1, Ordering::Relaxed);
+            self.speculator
+                .metrics
+                .pressure_skipped
+                .fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
         let Ok(slot) = self.speculator.slots.clone().try_acquire_owned() else {
             self.speculator
                 .metrics
@@ -259,10 +329,6 @@ impl Gateway {
         let Ok(admission) = self.admission.clone().try_acquire_owned() else {
             return None;
         };
-        let server = tool
-            .split_once("__")
-            .expect("configured prediction prefix")
-            .0;
         let Ok(client) = Client::with_connector(
             self.connectors[server].clone(),
             Some(self.metrics.upstream_calls.clone()),
@@ -330,7 +396,7 @@ impl Gateway {
                             let catalog = client.catalog_checked(deadline, || gateway.live(&isolated, epoch)).await.map_err(|_| Fault::denied())?;
                             if &catalog.revision != revision { return Err(Fault::denied()); }
                         }
-                        gateway.direct.run(gateway.clone(), isolated, tool.clone(), arguments, deadline, epoch).await
+                        crate::workflow::single(gateway.clone(), isolated, tool.clone(), arguments, deadline, epoch).await
                     } => Some(result),
                 };
                 if result.as_ref().is_some_and(|r| r.as_ref().map_or(true, |o| o.result["isError"] == true)) {

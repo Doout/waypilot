@@ -112,7 +112,9 @@ Responses retain at most 64 distinct validation observations; their arguments an
 maps share the workflow's 1 MiB retained-data budget. Each map permits 1 to 64 resource/version
 pairs with nonempty strings up to 256 bytes. Arguments, results, and version values are not
 trace fields. `mcp.state.validate`, `waypilot.cache.lookup`, and the graph's `validate_state`
-node expose validation, lookup, and release-barrier timing. Admin statistics count validated
+node expose validation, lookup, and release-barrier timing. Single calls use a straight-line
+`mcp.linear` path with the same release checks; authored workflows use the graph executor.
+Admin statistics count validated
 observations (`state_checks`), batch RPCs (`state_batches`), conflicts, and cache invalidations.
 
 ### Batch validation
@@ -212,6 +214,11 @@ target/debug/waypilot serve --config examples/local.toml
 ```
 
 Spans cover ingress, MCP requests, preparation, invocation and graph nodes. Node fields separate dependency wait, scheduler wait and execution. Results include elapsed time and `executed`, `reused`, `joined` or `bypassed` under `_meta["io.waypilot/runtime"]`. Application trace fields exclude arguments, credentials and results.
+
+`admission_us` on `mcp.upstream` measures time acquiring server/global call capacity;
+`queue_us` on `mcp.invoke` measures the later per-session lock wait, and `exchange_us` measures
+upstream I/O. Admin statistics expose `upstream_waiters` and cumulative
+`upstream_admission_us`; those aggregate waits overlap across requests.
 
 The exporter also supports `http/protobuf`. Incoming W3C context extraction and upstream trace propagation are unsupported. Overlapping span durations do not add up to elapsed request time.
 

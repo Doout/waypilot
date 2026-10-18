@@ -90,3 +90,32 @@ invariants fail the run if they differ.
 OTLP `mcp.invoke` spans now separate session-lock `queue_us` from `exchange_us`.
 `mcp.state.validate_set` times independent validation groups. Arguments, results, receipts
 and opaque resource versions remain excluded from trace fields.
+
+## Fast HR calls
+
+The earlier fast-tool direct/gateway comparison negotiated different protocols:
+MCP `2026-07-28` directly and `2025-11-25` through Waypilot. Its 48–65% latency difference
+included that protocol difference. The HR benchmark now defaults to the same 2025
+handshake, asserts the negotiated version, and separates initialization/shutdown timings.
+`--sdk-mode auto` retains the previous negotiation behavior for compatibility measurements.
+
+Single tool calls now execute their controls in order without allocating graph runs or
+cloning retained nodes. Authored workflows retain graph execution. HTTP requests and
+responses encode JSON once, and response extraction moves the owned result. Version,
+receipt, authorization, deadline and rate checks remain enabled. Speculative nominations
+yield to upstream pressure; this is a load signal, not a strict priority scheduler.
+
+Preserve the previous release before building the new one, then compare:
+
+```sh
+target/sdk-venv/bin/python scripts/benchmark_hr.py target/release/waypilot \
+  --baseline /path/to/previous/waypilot --runs 1000 --concurrency 500 \
+  --tool-ms 10 --think-ms 20 --training-think-ms 20 --training-runs 8 \
+  --mode direct --mode baseline_off --mode off --mode baseline_learn_auto --mode learn_auto \
+  --rounds 2 --cooldown-seconds 15 --output target/fast-hr.json
+```
+
+Direct/`off` make the same business calls; learned modes also validate state and receipts.
+Training uses separate employees. This owned loopback workload uses timers, no live LLM,
+and 64 active upstream call slots. Session latency includes initialization and shutdown;
+the client-concurrency cap counts whole sessions. Cooldown is outside measured time.

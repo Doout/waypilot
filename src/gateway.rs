@@ -107,6 +107,37 @@ struct Metrics {
     rejected: AtomicU64,
     expired: AtomicU64,
     connections: Arc<AtomicU64>,
+    upstream_waiters: AtomicU64,
+    upstream_admission_us: AtomicU64,
+}
+
+struct AdmissionWait<'a> {
+    metrics: &'a Metrics,
+    speculator: &'a speculation::Speculator,
+    started: Instant,
+}
+impl<'a> AdmissionWait<'a> {
+    fn new(metrics: &'a Metrics, speculator: &'a speculation::Speculator) -> Self {
+        metrics.upstream_waiters.fetch_add(1, Ordering::Relaxed);
+        Self {
+            metrics,
+            speculator,
+            started: Instant::now(),
+        }
+    }
+}
+impl Drop for AdmissionWait<'_> {
+    fn drop(&mut self) {
+        let elapsed = self.started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+        self.metrics
+            .upstream_admission_us
+            .fetch_add(elapsed, Ordering::Relaxed);
+        self.metrics
+            .upstream_waiters
+            .fetch_sub(1, Ordering::Relaxed);
+        self.speculator.note_queue(elapsed);
+        tracing::Span::current().record("admission_us", elapsed);
+    }
 }
 
 #[derive(Default)]
@@ -127,7 +158,6 @@ pub struct Gateway {
     profiles: Mutex<HashMap<String, Profile>>,
     metrics: Metrics,
     pub(crate) workflows: BTreeMap<String, crate::workflow::Compiled>,
-    direct: crate::workflow::Single,
     connectors: BTreeMap<String, Arc<Connector>>,
     server_admission: BTreeMap<String, Arc<Semaphore>>,
     upstream_admission: Arc<Semaphore>,
@@ -246,7 +276,6 @@ impl Gateway {
             );
         }
         Ok(Arc::new(Self {
-            direct: crate::workflow::Single::new(config.max_in_flight)?,
             speculator: speculation::Speculator::new(&config, policy.predictions()),
             body_readers: Arc::new(Semaphore::new(config.limits.body_readers)),
             body_bytes: Arc::new(Semaphore::new(config.limits.buffered_bytes)),
@@ -618,6 +647,7 @@ impl Gateway {
         })
     }
 
+    #[tracing::instrument(name = "mcp.upstream", skip_all, fields(admission_us = tracing::field::Empty))]
     async fn call_upstream(
         &self,
         session: &Session,
@@ -629,6 +659,7 @@ impl Gateway {
     ) -> Result<Value, Fault> {
         let tool = exposed.split_once("__").ok_or_else(Fault::invalid)?.1;
         let server = exposed.split_once("__").ok_or_else(Fault::invalid)?.0;
+        let waiting = AdmissionWait::new(&self.metrics, &self.speculator);
         let _server_slot = tokio::time::timeout_at(
             deadline,
             self.server_admission[server].clone().acquire_owned(),
@@ -647,6 +678,7 @@ impl Gateway {
                     message: "upstream queue deadline exceeded",
                 })?
                 .map_err(|_| Fault::denied())?;
+        drop(waiting);
         self.authorize(session, exposed, epoch)?;
         client
             .call_checked(tool, arguments, deadline, || {
@@ -807,16 +839,15 @@ impl Gateway {
                 .run(self.clone(), session.clone(), arguments, deadline, epoch)
                 .await?
         } else {
-            self.direct
-                .run(
-                    self.clone(),
-                    session.clone(),
-                    name.into(),
-                    arguments,
-                    deadline,
-                    epoch,
-                )
-                .await?
+            crate::workflow::single(
+                self.clone(),
+                session.clone(),
+                name.into(),
+                arguments,
+                deadline,
+                epoch,
+            )
+            .await?
         };
         self.authorize(&session, name, epoch)?;
         // Recheck inherited observations at release as well. An upstream effect
@@ -926,11 +957,12 @@ impl Gateway {
         {
             return Err(Fault::denied());
         }
-        ensure_size(&json!({"tools":tools})).map_err(|_| Fault {
+        let result = json!({"tools":tools});
+        ensure_size(&result).map_err(|_| Fault {
             code: -32002,
             message: "combined tool catalog exceeds limit",
         })?;
-        Ok(json!({"tools":tools}))
+        Ok(result)
     }
 
     async fn message(
@@ -1146,6 +1178,8 @@ impl Gateway {
             "rejected_capacity":metrics.rejected.load(Ordering::Relaxed),"sessions_expired":metrics.expired.load(Ordering::Relaxed),
             "active_requests":self.config.max_in_flight-self.admission.available_permits(),
             "active_upstream":self.config.limits.upstream_calls-self.upstream_admission.available_permits(),
+            "upstream_waiters":metrics.upstream_waiters.load(Ordering::Relaxed),
+            "upstream_admission_us":metrics.upstream_admission_us.load(Ordering::Relaxed),
             "active_initializations":self.config.limits.upstream_initializations-self.preparing.available_permits(),
             "body_readers":self.config.limits.body_readers-self.body_readers.available_permits(),
             "buffered_bytes":self.config.limits.buffered_bytes-self.body_bytes.available_permits(),

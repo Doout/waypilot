@@ -41,6 +41,13 @@ retain 32 recent observations and require eight prediction outcomes before apply
 outcome-based retirement gate. Frequency and expected-benefit gates also apply during
 that trial period. These limits can be set under `speculation.learning`.
 
+Nominations also yield when upstream calls are queued, initialization capacity is full,
+or less than roughly a quarter of either call budget is free. This pressure check applies
+to authored and learned rules; `speculation.pressure_skipped` counts it. It does not retire
+a rule or relax any check on later demand. A shared admission wait of at least 1 ms
+defers new nominations for 100 ms, refreshed by further waits, so brief gaps between
+queued calls do not immediately launch more speculative work.
+
 ## Review and control
 
 ```sh

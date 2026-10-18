@@ -21,7 +21,8 @@ async def run_agent(
         )
         if result.get("isError"):
             raise RuntimeError("HR tool failed: " + tool)
-        handle = result.get("_meta", {}).get(META, {}).get("receipt")
+        metadata = result.get("_meta") or {}
+        handle = metadata.get(META, {}).get("receipt")
         if guarded and not write:
             if not handle:
                 raise RuntimeError("missing HR observation receipt")
@@ -33,7 +34,7 @@ async def run_agent(
                 "tool": tool,
                 "elapsed_ms": (time.perf_counter_ns() - before) / 1e6,
                 "request_ns": before,
-                "runtime": result.get("_meta", {}).get("io.waypilot/runtime", {}),
+                "runtime": metadata.get("io.waypilot/runtime", {}),
             }
         )
         return result["structuredContent"]

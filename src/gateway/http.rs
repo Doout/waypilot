@@ -1,5 +1,5 @@
 //! Streamable HTTP ingress and operator endpoints.
-use super::{ensure_size, rpc_error, valid_request, Actor, Gateway, Session};
+use super::{rpc_error, valid_request, Actor, Gateway, Session};
 use crate::upstream::{MAX_MESSAGE, VERSIONS};
 use anyhow::Result;
 use axum::{
@@ -52,14 +52,15 @@ async fn readiness(State(gateway): State<Arc<Gateway>>) -> Response {
 }
 
 fn json_response(status: StatusCode, value: Value) -> Response {
-    if ensure_size(&value).is_err() {
+    let bytes = serde_json::to_vec(&value).unwrap_or_default();
+    if bytes.is_empty() || bytes.len() > MAX_MESSAGE {
         return (
             StatusCode::BAD_GATEWAY,
             Json(rpc_error(Value::Null, -32002, "response exceeds limit")),
         )
             .into_response();
     }
-    (status, Json(value)).into_response()
+    (status, [("content-type", "application/json")], bytes).into_response()
 }
 fn authorize_http(gateway: &Gateway, headers: &HeaderMap) -> Result<Arc<Actor>, StatusCode> {
     if !gateway.origin(headers) {

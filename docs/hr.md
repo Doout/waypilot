@@ -99,6 +99,14 @@ Training employees never appear in measurement, so ordinary cache warming cannot
 the measured reads. All modes must match structured observations, decisions and exact
 case effects. Two rounds reverse mode order; no latency threshold is a correctness gate.
 
+The benchmark defaults to `--sdk-mode legacy`, requiring MCP `2025-11-25` on both paths.
+`--sdk-mode auto` measures normal discovery/fallback too; the owned peer currently
+negotiates `2026-07-28` directly while Waypilot negotiates `2025-11-25`. These modes have
+different protocol costs and must not be presented as isolated forwarding overhead.
+Reports record negotiated versions and initialization/shutdown percentiles separately.
+Use `--cooldown-seconds 15` between large cold-session trials on hosts with a small
+ephemeral port range; the pause is outside measurements.
+
 Vary `--think-ms` (including zero), `--state-ms` (validator delay, default 1),
 `--wrong-every`, `--slots`, `--concurrency` and `--training-runs 0`. Reports include
 agent/tool waits, p50/p95/p99, session percentiles including SDK initialization/shutdown,
@@ -126,20 +134,6 @@ Gateway OTLP spans include `mcp.predict`, `mcp.speculate` and the usual preparat
 validation, cache and invocation spans. Arguments, employee IDs, results and receipts
 stay out of trace fields. Client think/tool times are in the agent JSON report.
 
-Local measurements on 2026-10-17 (macOS ARM64, 32 agents, concurrency 4, 250 ms reads,
-1 ms validators, 200 ms planning pauses, 20% benefits branches, four disjoint training
-agents, two reversed rounds). Session p95 includes SDK initialization and shutdown:
-
-| Mode | Session p95 | Tool/validator RPCs |
-| --- | ---: | ---: |
-| Direct | 1,383–1,388 ms | 122 |
-| Uncached forwarding | 1,397–1,404 ms | 122 |
-| Guarded prewarm | 1,430–1,439 ms | 482 |
-| Lookahead | 1,033–1,038 ms | 598 |
-| Lookahead with batching | 1,021–1,022 ms | 482 |
-
-Batching reduced physical RPCs by 19%, with the same 470 logical checks per round.
-Both lookahead modes had 58 nominations, 52 selected cache hits and six unused guesses.
-Observations and all 32 case effects matched. Frequency gates predictability; these authored-rule modes have
-no learned cost/benefit gate. The separate automatic modes evaluate that gate. Run zero-pause, slower-validator, cold and miss-heavy
-controls before generalizing these warm-history measurements to a different agent or server.
+See [latency measurements](latency.md) for protocol-matched comparisons. Earlier HR
+figures used SDK auto-negotiation and mixed the newer direct protocol with the gateway's
+2025 protocol. They describe that setup, not a measured cost of forwarding alone.

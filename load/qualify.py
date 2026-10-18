@@ -197,6 +197,7 @@ arguments = {{ owner = {{ input = "/owner" }}, nonce = {{ input = "/nonce" }}, p
                 s["active_requests"]
                 == s["active_upstream"]
                 == s["active_initializations"]
+                == s.get("upstream_waiters", 0)
                 == s["cleanup"]["pending"]
                 == p["active"]
                 == 0
