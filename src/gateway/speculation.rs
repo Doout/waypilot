@@ -296,6 +296,8 @@ impl Gateway {
         // signal; the ordinary admission limits still bound every dispatch.
         let reserve = |limit: usize| limit.div_ceil(4).min(limit.saturating_sub(1));
         if self.speculator.pressured()
+            || self.config.max_in_flight - self.admission.available_permits()
+                > self.config.limits.upstream_calls
             || self.metrics.upstream_waiters.load(Ordering::Relaxed) > 0
             || self.upstream_admission.available_permits()
                 <= reserve(self.config.limits.upstream_calls)
