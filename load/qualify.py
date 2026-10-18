@@ -74,6 +74,7 @@ class Qualification:
         self.stop_sampling = asyncio.Event()
         self.sampling_paused = False
         self.last_wait_state = {}
+        self.trace_snapshot = None
         self.session_ttl = 180
         self.request_timeout_ms = 5000
 
@@ -1001,13 +1002,18 @@ arguments = {{ owner = {{ input = "/owner" }}, nonce = {{ input = "/nonce" }}, p
             traces = None
             if self.collector_http:
                 _, _, traces = await self.collector_http.request("/stats")
+                self.trace_snapshot = traces
                 assert {
                     "gateway.http",
                     "mcp.gateway.request",
                     "mcp.invoke",
-                    "workflow.node",
-                } <= traces["trace_names"].keys()
-                assert traces["trace_timings"] > 0
+                } <= traces["trace_names"].keys(), traces
+                # Small graph phases can legitimately receive no sampled roots.
+                # Full-sampling verification checks deterministic graph coverage.
+                if self.args.trace_ratio == 1:
+                    assert "workflow.node" in traces["trace_names"], traces
+                if "workflow.node" in traces["trace_names"]:
+                    assert traces["trace_timings"] > 0, traces
             peak_rss = max(sample["rss_bytes"] for sample in self.resources)
             assert peak_rss < self.args.max_rss_mb * 1024 * 1024, (
                 peak_rss,
@@ -1103,6 +1109,7 @@ def main():
                     "passed": False,
                     "error": repr(error),
                     "last_wait_state": qualification.last_wait_state,
+                    "tracing": qualification.trace_snapshot,
                     "phases": qualification.phases,
                     "resources": qualification.resources,
                 },

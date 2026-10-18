@@ -4,6 +4,10 @@
 
 Follow the [README](../README.md#test-and-benchmark) to install test dependencies, then run `bash scripts/verify.sh`. It runs formatting, Clippy, Rust tests, live JSON/SSE and stdio checks, the official Python MCP SDK, OTLP validation and a 64-client/32-call scale test.
 
+Verification uses full trace sampling to require graph coverage deterministically.
+Sampled load tests require request/invocation traces and validate graph timings when
+graph spans are sampled; a small graph phase can legitimately have no sampled roots.
+
 CI runs on Linux and macOS. Linux also runs the 1,000-client/500-call release test. Artifacts include `scale-smoke.json`, `benchmark.json`, `gateway-benchmark.json` and `mcp-demo.json`, plus Linux `scale-qualification.json`. Reports upload on failure too.
 
 Linux repeats automatic pattern learning in three fresh trials of 1,000 agents at

@@ -20,7 +20,7 @@ cargo build --locked
 "${WAYPILOT_SDK_PYTHON:-$WAYPILOT_PYTHON}" load/agent_faults.py target/debug/waypilot --iterations 1 --output target/agent-faults.json
 "$WAYPILOT_PYTHON" scripts/check_otel.py target/debug/waypilot
 
-"$WAYPILOT_PYTHON" load/qualify.py target/debug/waypilot --clients 64 --concurrency 32 --seconds 3 --rate 100 --trace-ratio 0.1 --output target/scale-smoke.json
+"$WAYPILOT_PYTHON" load/qualify.py target/debug/waypilot --clients 64 --concurrency 32 --seconds 3 --rate 100 --trace-ratio 1 --output target/scale-smoke.json
 
 "$WAYPILOT_PYTHON" load/state_qualify.py target/debug/waypilot --clients 64 --concurrency 32 --output target/state-scale-smoke.json
 
