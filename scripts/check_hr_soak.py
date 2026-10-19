@@ -6,11 +6,28 @@ from collections import Counter
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "load"))
-from hr_soak import PHASES, plan, read_oracle
+from hr_soak import PHASES, Continuity, plan, read_oracle
 from hr_soak_peer import VariableHR
+from soak_collector import timing_attribute
 
 
 class SoakTests(unittest.TestCase):
+    def test_only_finite_known_timing_attributes_are_collected(self):
+        for value in [{"intValue": "1000"}, {"doubleValue": 1000}, {"stringValue": "1000"}]:
+            self.assertEqual(timing_attribute({"key": "queue_us", "value": value}), ("queue_us", 1))
+        self.assertIsNone(timing_attribute({"key": "queue_us", "value": {"stringValue": "NaN"}}))
+        self.assertIsNone(timing_attribute({"key": "arguments", "value": {"stringValue": "1000"}}))
+
+    def test_suspend_clock_jump_and_runner_stall_are_detected(self):
+        clock = Continuity(1000, 100)
+        self.assertFalse(clock.sample(1002, 102)["interrupted"])
+        self.assertTrue(clock.sample(1604, 104)["interrupted"])
+        clock = Continuity(1000, 100)
+        self.assertTrue(clock.sample(1001, 104)["interrupted"])
+        clock = Continuity(1000, 100)
+        self.assertTrue(clock.sample(1020, 120)["interrupted"])
+        self.assertEqual(clock.max_sample_gap, 20)
+
     def test_plan_is_frozen_and_changes_with_seed(self):
         first = plan(3600, 2, 20261018)
         self.assertEqual(first, plan(3600, 2, 20261018))

@@ -28,6 +28,29 @@ MODES = ["direct", "guarded", "auto"]
 PHASES = ["leave-heavy", "benefits-drift", "mixed-refresh", "leave-recovery", "bursty", "mixed"]
 
 
+class Continuity:
+    """Reject suspend, wall-clock jumps and long runner stalls in qualified runs."""
+
+    def __init__(self, wall, monotonic):
+        self.wall, self.monotonic, self.previous = wall, monotonic, monotonic
+        self.max_clock_skew = self.max_sample_gap = 0.0
+
+    def sample(self, wall, monotonic):
+        elapsed = monotonic - self.monotonic
+        skew = wall - self.wall - elapsed
+        gap = monotonic - self.previous
+        self.previous = monotonic
+        self.max_clock_skew = max(self.max_clock_skew, abs(skew))
+        self.max_sample_gap = max(self.max_sample_gap, gap)
+        return {
+            "wall_elapsed_seconds": wall - self.wall,
+            "active_elapsed_seconds": elapsed,
+            "wall_monotonic_skew_seconds": skew,
+            "sample_gap_seconds": gap,
+            "interrupted": abs(skew) > 2 or gap > 10,
+        }
+
+
 def percentile(values, fraction):
     return sorted(values)[max(0, math.ceil(len(values) * fraction) - 1)] if values else None
 
@@ -215,6 +238,7 @@ def latency(rows):
 async def run(args):
     args.output_dir.mkdir(parents=True, exist_ok=False)
     episodes = plan(args.seconds, args.rate, args.seed, args.pause_scale)
+    modes = MODES + (["baseline_auto"] if args.baseline else [])
     atomic_json(args.output_dir / "plan.json", episodes)
     output = {
         "status": "running",
@@ -230,11 +254,15 @@ async def run(args):
             "protocol": "2025-11-25",
             "trace_ratio": args.trace_ratio,
             "pause_scale": args.pause_scale,
+            "require_uninterrupted": args.require_uninterrupted,
             "comparison": "Concurrent isolated peers, identical seeded plans and call budgets; direct has no gateway state/receipt guards; guarded and auto share those controls. All share the host.",
             "timing": "Agent includes actual thinking pauses; session adds handshake/close; scheduled completion includes client queueing. Arrival-cohort windows separate workload drift from learning age.",
             "limits": "Owned synthetic HR over loopback HTTP; no LLM, vendor, WAN/TLS, or distributed snapshot. Per-query deterministic service-time variation includes 1% long reads and 10% fast reads.",
         },
         "binary_sha256": hashlib.sha256(Path(args.binary).read_bytes()).hexdigest(),
+        "baseline_binary_sha256": hashlib.sha256(Path(args.baseline).read_bytes()).hexdigest()
+        if args.baseline
+        else None,
         "platform": platform.platform(),
         "started_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "sources_sha256": {
@@ -259,7 +287,7 @@ async def run(args):
         )
         collector_url = "http://" + collector.ready["listen"]
         sandboxes = {}
-        for mode in MODES:
+        for mode in modes:
             environment = {
                 "OTEL_SERVICE_NAME": "hr-soak-" + mode,
                 "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": collector_url + "/v1/traces",
@@ -269,12 +297,12 @@ async def run(args):
             }
             sandboxes[mode] = stack.enter_context(
                 Sandbox(
-                    args.binary,
+                    args.baseline if mode == "baseline_auto" else args.binary,
                     "off" if mode == "direct" else "prewarm" if mode == "guarded" else "speculate",
                     peer_script=ROOT / "load/hr_soak_peer.py",
                     state_ms=5,
                     environment=environment,
-                    learning="auto" if mode == "auto" else None,
+                    learning="auto" if mode in {"auto", "baseline_auto"} else None,
                     batch_validation=mode != "direct",
                     duration_ms=5000,
                     slots=8,
@@ -288,18 +316,25 @@ async def run(args):
         peers = {
             mode: psutil.Process(sb.peer_process.process.pid) for mode, sb in sandboxes.items()
         }
-        cpu_start = {mode: processes[mode].cpu_times() for mode in MODES}
-        peer_cpu_start = {mode: peers[mode].cpu_times() for mode in MODES}
-        rows = {mode: [] for mode in MODES}
+        cpu_start = {mode: processes[mode].cpu_times() for mode in modes}
+        peer_cpu_start = {mode: peers[mode].cpu_times() for mode in modes}
+        rows = {mode: [] for mode in modes}
         samples, lags, active, peaks = [], [], Counter(), Counter()
         stop = asyncio.Event()
-        semaphores = {mode: asyncio.Semaphore(args.concurrency) for mode in MODES}
-        slots = {mode: asyncio.Semaphore(64) for mode in MODES}
+        semaphores = {mode: asyncio.Semaphore(args.concurrency) for mode in modes}
+        slots = {mode: asyncio.Semaphore(64) for mode in modes}
         records = stack.enter_context((args.output_dir / "agents.jsonl").open("w", buffering=1))
         events = stack.enter_context((args.output_dir / "progress.jsonl").open("w", buffering=1))
         started = time.monotonic()
+        clock = Continuity(time.time(), started)
+        output["traffic_started_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        output["continuity"] = {
+            "interruptions": [],
+            "max_clock_skew_seconds": 0,
+            "max_sample_gap_seconds": 0,
+        }
         output["pids"] = {
-            mode: {"gateway": processes[mode].pid, "peer": peers[mode].pid} for mode in MODES
+            mode: {"gateway": processes[mode].pid, "peer": peers[mode].pid} for mode in modes
         }
 
         async def one(mode, spec):
@@ -376,7 +411,7 @@ async def run(args):
                     "stats": stats,
                     "peer": peer,
                     "rules": (await asyncio.to_thread(sandbox.predictions))
-                    if mode == "auto"
+                    if mode in {"auto", "baseline_auto"}
                     else None,
                 }
             event["host"] = {
@@ -394,7 +429,7 @@ async def run(args):
                 json.dumps(
                     {
                         "elapsed_seconds": round(elapsed, 1),
-                        "completed": {m: len(rows[m]) for m in MODES},
+                        "completed": {m: len(rows[m]) for m in modes},
                         "active": dict(active),
                         "auto_rules": Counter(
                             r["status"] for r in event["modes"]["auto"]["rules"]["rules"]
@@ -408,7 +443,18 @@ async def run(args):
             next_report = 0
             while not stop.is_set():
                 sample = {"elapsed_seconds": time.monotonic() - started}
-                for mode in MODES:
+                sample["clock"] = clock.sample(time.time(), time.monotonic())
+                output["continuity"].update(
+                    max_clock_skew_seconds=clock.max_clock_skew,
+                    max_sample_gap_seconds=clock.max_sample_gap,
+                )
+                if sample["clock"]["interrupted"]:
+                    if not output["continuity"]["interruptions"]:
+                        output["continuity"]["interruptions"].append(sample["clock"])
+                    assert not args.require_uninterrupted, (
+                        "run interrupted by host sleep, clock discontinuity or runner stall"
+                    )
+                for mode in modes:
                     sample[mode] = {
                         "rss_bytes": processes[mode].memory_info().rss,
                         "fds": processes[mode].num_fds(),
@@ -433,7 +479,8 @@ async def run(args):
                     await asyncio.sleep(max(0, due - time.monotonic()))
                     lags.append(max(0, (time.monotonic() - due) * 1000))
                     # Rotate lane dispatch order to avoid systematically favoring one path.
-                    order = MODES[spec["index"] % 3 :] + MODES[: spec["index"] % 3]
+                    offset = spec["index"] % len(modes)
+                    order = modes[offset:] + modes[:offset]
                     for mode in order:
                         tasks.append(group.create_task(one(mode, spec)))
                 await asyncio.sleep(max(0, started + args.seconds - time.monotonic()))
@@ -535,10 +582,10 @@ async def run(args):
             if args.seconds >= 600:
                 assert finals["auto"]["speculation"]["started"] > 0
                 assert finals["auto"]["speculation"]["selected"] > 0
-            indexed = {mode: {row["index"]: row for row in rows[mode]} for mode in MODES}
+            indexed = {mode: {row["index"]: row for row in rows[mode]} for mode in modes}
             paired = []
             for spec in episodes:
-                current = {mode: indexed[mode][spec["index"]] for mode in MODES}
+                current = {mode: indexed[mode][spec["index"]] for mode in modes}
                 assert len({row["digest"] for row in current.values()}) == 1, (
                     spec,
                     "mode output differs",
@@ -551,6 +598,14 @@ async def run(args):
                         - current["auto"]["agent_ms"],
                         "saved_ms_vs_guarded": current["guarded"]["agent_ms"]
                         - current["auto"]["agent_ms"],
+                        **(
+                            {
+                                "saved_ms_vs_baseline_auto": current["baseline_auto"]["agent_ms"]
+                                - current["auto"]["agent_ms"]
+                            }
+                            if args.baseline
+                            else {}
+                        ),
                     }
                 )
             atomic_json(args.output_dir / "paired.json", paired)
@@ -561,6 +616,7 @@ async def run(args):
                 actual_seconds=time.monotonic() - started,
                 scheduled_traffic_seconds=args.seconds,
                 scheduler_lag_p99_ms=percentile(lags, 0.99),
+                wall_elapsed_seconds=time.time() - clock.wall,
             )
             await asyncio.sleep(2)  # Allow the final OTLP batch to arrive after all calls drain.
             await snapshot(final=True)
@@ -574,10 +630,6 @@ async def run(args):
                 status="failed", error=repr(error), actual_seconds=time.monotonic() - started
             )
             for mode, sb in sandboxes.items():
-                for name, proc in [("gateway", sb.service), ("peer", sb.peer_process)]:
-                    proc.log.flush()
-                    proc.log.seek(0)
-                    (args.output_dir / f"{mode}-{name}.log").write_text(proc.log.read())
                 try:
                     output["modes"][mode] = {"stats": sb.stats(), "rules": sb.predictions()}
                 except Exception as snapshot_error:
@@ -585,12 +637,21 @@ async def run(args):
             atomic_json(args.output_dir / "resources.json", samples)
             raise
         finally:
+            # Preserve diagnostics on successful trials as well as failures.
+            for mode, sandbox in sandboxes.items():
+                for name, process in [("gateway", sandbox.service), ("peer", sandbox.peer_process)]:
+                    process.log.flush()
+                    process.log.seek(0)
+                    (args.output_dir / f"{mode}-{name}.log").write_text(process.log.read())
             atomic_json(args.output_dir / "results.json", output)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary")
+    parser.add_argument(
+        "--baseline", help="Also run a frozen previous predictor against the identical plan"
+    )
     parser.add_argument("--seconds", type=int, default=3600)
     parser.add_argument("--rate", type=float, default=2)
     parser.add_argument("--concurrency", type=int, default=128)
@@ -598,6 +659,7 @@ def main():
     parser.add_argument("--trace-ratio", type=float, default=0.1)
     parser.add_argument("--report-seconds", type=int, default=60)
     parser.add_argument("--max-rss-mb", type=int, default=512)
+    parser.add_argument("--require-uninterrupted", action="store_true")
     parser.add_argument(
         "--pause-scale",
         type=float,

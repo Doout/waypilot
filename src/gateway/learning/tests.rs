@@ -31,6 +31,7 @@ fn prior(learner: &Learner, n: i64) -> Observation {
             "hr__employee",
             &json!({"requested_id":n}),
             &outcome(n + 100),
+            vec![],
         )
         .unwrap()
 }
@@ -108,7 +109,7 @@ fn coincidence_ambiguous_identity_and_changed_schema_fail_closed() {
     let l = learner(LearningMode::Auto);
     for n in 1..=3 {
         let p = l
-            .observation("hr__employee", &json!({"id":n}), &outcome(n))
+            .observation("hr__employee", &json!({"id":n}), &outcome(n), vec![])
             .unwrap();
         l.observe(
             "alice",
@@ -124,7 +125,7 @@ fn coincidence_ambiguous_identity_and_changed_schema_fail_closed() {
         );
     }
     let changed = l
-        .observation("hr__employee", &json!({"id":9}), &outcome(900))
+        .observation("hr__employee", &json!({"id":9}), &outcome(900), vec![])
         .unwrap();
     assert!(
         l.nominate("alice", 1, &changed).is_none(),
@@ -196,11 +197,12 @@ fn misses_and_no_gap_prevent_activation_and_bad_trials_retire_then_relearn() {
         trial.finish(true, 120_000.0);
     }
     assert_eq!(l.report(1)["rules"][0]["retired_reason"], "no_wait_benefit");
-    assert_eq!(l.report(1)["rules"][0]["recovery_observations_required"], 8);
+    assert_eq!(l.report(1)["rules"][0]["recovery_observations_required"], 4);
     for n in 8..12 {
         observe(&l, n, "hr__balance", true);
     }
-    assert_eq!(l.report(1)["rules"][0]["status"], "retired");
+    assert_eq!(l.report(1)["rules"][0]["status"], "active");
+    assert_eq!(l.report(1)["rules"][0]["recoveries"], 2);
 }
 #[test]
 fn context_budget_is_released_and_unsupported_arguments_are_not_guessed() {
@@ -213,7 +215,8 @@ fn context_budget_is_released_and_unsupported_arguments_are_not_guessed() {
         .observation(
             "hr__employee",
             &json!({"id":"x".repeat(CONTEXT_LIMIT)}),
-            &outcome(1)
+            &outcome(1),
+            vec![],
         )
         .is_none());
     l.observe(
@@ -340,4 +343,130 @@ fn unselected_cache_hits_reduce_benefit_but_predictions_do_not_train_the_baselin
             assert!(trial.cancel.is_cancelled());
         }
     }
+}
+
+#[test]
+fn identical_tools_in_different_histories_do_not_pool_evidence_or_approvals() {
+    let l = learner(LearningMode::Approval);
+    for n in 1..=4 {
+        for (history, target) in [
+            ("hr__leave_policy", "hr__balance"),
+            ("hr__benefits", "hr__options"),
+        ] {
+            let mut p = prior(&l, n);
+            p.context = vec![history.into()];
+            l.observe(
+                "alice",
+                1,
+                &p,
+                target,
+                &json!({"id":n+100}),
+                &outcome(n),
+                60_000.0,
+                100_000.0,
+                false,
+                true,
+            );
+        }
+    }
+    let report = l.report(1);
+    let rules = report["rules"].as_array().unwrap();
+    assert_eq!(rules.len(), 2);
+    assert!(rules.iter().all(|r| r["confidence_percent"] == 100.0));
+    let id = rules[0]["id"].as_str().unwrap();
+    l.decide(id, true);
+    let mut p = prior(&l, 55);
+    p.context = vec!["hr__leave_policy".into()];
+    assert_eq!(
+        (0..5)
+            .find_map(|_| l.nominate("alice", 1, &p))
+            .unwrap()
+            .tool,
+        "hr__balance"
+    );
+    p.context = vec!["hr__benefits".into()];
+    assert!(
+        l.nominate("alice", 1, &p).is_none(),
+        "approval cannot cross histories"
+    );
+    assert_ne!(rules[0]["id"], rules[1]["id"]);
+    p.context.clear();
+    assert!(
+        l.nominate("alice", 1, &p).is_none(),
+        "unknown history is not a global fallback"
+    );
+}
+
+#[test]
+fn repeated_retirement_recovers_from_fresh_shadow_evidence_without_erasing_work() {
+    let l = trained(LearningMode::Auto);
+    let id = l.report(1)["rules"][0]["id"].as_str().unwrap().to_string();
+    for cycle in 0..10 {
+        for _ in 0..3 {
+            drop(l.start(&id, 1).unwrap());
+        }
+        assert_eq!(l.report(1)["rules"][0]["status"], "retired");
+        for n in 1..=3 {
+            observe(&l, 100 + cycle * 10 + n, "hr__balance", true);
+            assert_eq!(l.report(1)["rules"][0]["status"], "retired");
+        }
+        observe(&l, 104 + cycle * 10, "hr__balance", true);
+        let r = l.report(1);
+        assert_eq!(r["rules"][0]["status"], "active");
+        assert_eq!(r["rules"][0]["recovery_observations_required"], 4);
+        assert_eq!(r["rules"][0]["recoveries"], cycle + 1);
+        assert_eq!(r["rules"][0]["unused"], (cycle + 1) * 3);
+    }
+}
+
+#[test]
+fn selected_calls_misses_and_zero_wait_cannot_recover_a_rule() {
+    let l = trained(LearningMode::Auto);
+    let id = l.report(1)["rules"][0]["id"].as_str().unwrap().to_string();
+    for _ in 0..3 {
+        drop(l.start(&id, 1).unwrap());
+    }
+    for n in 4..20 {
+        l.observe(
+            "alice",
+            1,
+            &prior(&l, n),
+            "hr__balance",
+            &json!({"employee":{"id":n+100}}),
+            &outcome(n),
+            60_000.0,
+            100_000.0,
+            true,
+            true,
+        );
+    }
+    assert_eq!(l.report(1)["rules"][0]["recovery_progress"], 0);
+    for n in 20..23 {
+        observe(&l, n, "hr__balance", true);
+    }
+    assert_eq!(l.report(1)["rules"][0]["recovery_progress"], 3);
+    observe(&l, 24, "hr__other", false);
+    assert_eq!(l.report(1)["rules"][0]["recovery_progress"], 2);
+    for n in 25..50 {
+        l.observe(
+            "alice",
+            1,
+            &prior(&l, n),
+            "hr__balance",
+            &json!({"employee":{"id":n+100}}),
+            &outcome(n),
+            0.0,
+            100_000.0,
+            false,
+            true,
+        );
+    }
+    assert_eq!(l.report(1)["rules"][0]["recovery_progress"], 0);
+    assert_eq!(l.report(1)["rules"][0]["status"], "retired");
+    l.decide(&id, false);
+    for n in 50..90 {
+        observe(&l, n, "hr__balance", true);
+    }
+    assert_eq!(l.report(1)["rules"][0]["status"], "rejected");
+    assert!(l.start(&id, 1).is_none());
 }

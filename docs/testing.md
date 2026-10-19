@@ -66,6 +66,7 @@ For a continuous one-hour comparison with changing agent behavior:
 ```sh
 target/sdk-venv/bin/python load/hr_soak.py target/release/waypilot \
   --seconds 3600 --rate 2 --concurrency 128 --trace-ratio 0.1 \
+  --require-uninterrupted \
   --output-dir target/hr-soak-$(date +%Y%m%d-%H%M%S)
 ```
 
@@ -84,6 +85,13 @@ It fails on unexpected errors, effect mismatches, resource growth or incomplete 
 Output directories must be new. `--pause-scale 0.01 --seconds 18 --rate 1` provides a smoke
 check; use the default pause scale for measurements. This tests realistic pacing rather
 than the separate 1,000-connected-client/500-active-call capacity qualification.
+
+`--require-uninterrupted` rejects a wall/monotonic-clock discrepancy above two seconds or
+a monitor gap above ten seconds. Keep a laptop powered with its lid open; an idle-sleep
+inhibitor cannot prevent lid-closed sleep. Clock samples and successful-run diagnostics
+are retained. `--baseline /path/to/frozen/waypilot` adds the previous automatic predictor
+as a fourth path with the same plan and budgets, alongside direct, guarded and current
+automatic execution. Compare that path to isolate the runtime change from host/run noise.
 
 ## Forwarding overhead
 

@@ -5,6 +5,12 @@ inputs or structured results. No transition list or parameter mapping is require
 Every agent still chooses and sends each actual call. One predicted read may run ahead;
 a matching demand can join it after the usual authorization and state checks.
 
+Rules are conditioned on the last two successful, sequential tool names before the
+source call. `context_depth` accepts 0–4 (default 2); zero restores adjacent-call grouping.
+Histories contain no argument or result values, share the existing context byte budget,
+and break on errors, overlap, or generation changes. Different histories have different
+rule identities and approvals. Unknown histories do not fall back to another rule.
+
 The target needs a configured effect-free, session-independent, state-validated reuse
 contract and an explicit user `speculative_tools` grant. Observed behavior cannot grant
 permission, establish read-only semantics, or authorize early disclosure. Writes are
@@ -31,8 +37,12 @@ max_waste_percent = 25
   with poor recent confidence, wait reduction, or excessive unused predictions.
 
 Approval does not override performance thresholds. Rejection remains effective in auto
-mode. Retired rules can recover after fresh successful shadow observations (initially 16).
-Repeated failures double this interval up to 64 times the base, capped at 4,096 observations.
+mode. Retired rules earn recovery credit from actual, unselected calls whose matching
+arguments and observed gap show wait benefit. Misses and absent benefit remove credit.
+Recovery requires `recovery_samples` credits (default 16) plus the recent confidence and
+benefit gates; repeated retirement does not increase that requirement. Recovered trials
+keep the same outcome waste budget, holdouts and lifetime work counters. Reports include
+`context`, `recoveries`, and `recovery_progress` so recovery can be audited.
 Late outcomes from an earlier trial remain in lifetime work counts but cannot retire a
 recovered trial.
 One randomly placed opportunity in each block of five stays unspeculated to refresh the
@@ -88,7 +98,8 @@ string/number leaves across inputs and `structuredContent`, including nested arg
 Each binding needs multiple distinct observed values. If several source pointers match,
 a prediction runs only while they agree; subsequent actual calls can disambiguate them.
 Constants, booleans/nulls, transformations, unstructured text, cross-session sequences,
-and arbitrary multi-step graphs are not inferred. Speculative completions do not train
+and arbitrary multi-step graphs are not inferred. History does not reveal intent before
+the caller expresses it. Speculative completions do not train
 or trigger further predictions. Catalog identity is checked again before learned dispatch.
 The ordinary runtime response metadata includes `predicted_tool` when a prediction was
 dispatched. Correctness tests use peer events as a completion barrier; benchmarks never do.

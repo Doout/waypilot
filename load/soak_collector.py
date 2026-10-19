@@ -12,6 +12,19 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 
+def timing_attribute(attribute):
+    key = attribute["key"].rsplit(".", 1)[-1]
+    if key not in {"admission_us", "queue_us", "exchange_us"}:
+        return None
+    value = attribute["value"]
+    number = value.get("intValue", value.get("doubleValue", value.get("stringValue")))
+    try:
+        number = float(number)
+    except (TypeError, ValueError):
+        return None
+    return (key, number / 1000) if math.isfinite(number) and number >= 0 else None
+
+
 async def main():
     histograms, totals = {}, Counter()
 
@@ -42,12 +55,9 @@ async def main():
                     record(service, span["name"], (end - start) / 1e6)
                     totals[service] += 1
                     for attribute in span.get("attributes", []):
-                        key = attribute["key"]
-                        if key in {"admission_us", "queue_us", "exchange_us"}:
-                            value = attribute["value"]
-                            number = value.get("intValue", value.get("doubleValue"))
-                            if number is not None:
-                                record(service, span["name"] + "." + key, float(number) / 1000)
+                        timing = timing_attribute(attribute)
+                        if timing:
+                            record(service, span["name"] + "." + timing[0], timing[1])
         return JSONResponse({})
 
     async def stats(_request):
