@@ -532,7 +532,7 @@ fn next_id(sequence: &AtomicU64) -> Result<u64> {
 }
 
 fn result(reply: Option<Value>, id: u64) -> Result<Value> {
-    let reply = reply.context("missing JSON-RPC response")?;
+    let mut reply = reply.context("missing JSON-RPC response")?;
     ensure!(
         reply["jsonrpc"] == "2.0"
             && reply["id"] == id
@@ -543,8 +543,8 @@ fn result(reply: Option<Value>, id: u64) -> Result<Value> {
         bail!("upstream returned a JSON-RPC error");
     }
     reply
-        .get("result")
-        .cloned()
+        .as_object_mut()
+        .and_then(|reply| reply.remove("result"))
         .context("missing JSON-RPC result")
 }
 
@@ -553,12 +553,16 @@ async fn exchange(
     message: Value,
     deadline: Instant,
 ) -> Result<Option<Value>> {
+    let encoded = serde_json::to_vec(&message)?;
     ensure!(
-        serde_json::to_vec(&message)?.len() <= MAX_MESSAGE,
+        encoded.len() <= MAX_MESSAGE,
         "outgoing MCP message exceeds limit"
     );
     match &mut connection.wire {
-        Wire::Stdio(process) => process.call(message, deadline).await,
+        Wire::Stdio(process) => {
+            drop(encoded);
+            process.call(message, deadline).await
+        }
         Wire::Http {
             client,
             url,
@@ -571,7 +575,8 @@ async fn exchange(
                 .post(url.clone())
                 .headers(headers.as_ref().clone())
                 .header("Accept", "application/json, text/event-stream")
-                .json(&message);
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(encoded);
             if !initializing {
                 request = request.header("MCP-Protocol-Version", &connection.version);
             }

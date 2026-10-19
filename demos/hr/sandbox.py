@@ -36,8 +36,10 @@ class Sandbox:
         read_delays=None,
         environment=None,
         max_in_flight=64,
+        upstream_calls=64,
         learning=None,
         learning_options=None,
+        peer_script=None,
     ):
         self.binary = str(Path(binary).resolve())
         self.mode = mode
@@ -67,7 +69,7 @@ class Sandbox:
                 Process(
                     [
                         sys.executable,
-                        str(ROOT / "demos/hr/workbench.py"),
+                        str(peer_script or ROOT / "demos/hr/workbench.py"),
                         "--delay-ms",
                         str(delay_ms),
                         "--state-ms",
@@ -90,7 +92,7 @@ max_sessions = 2048
 max_in_flight = {max_in_flight}
 [limits]
 body_readers = 512
-upstream_calls = 64
+upstream_calls = {upstream_calls}
 upstream_initializations = 64
 [[users]]
 id = "hr-agent"

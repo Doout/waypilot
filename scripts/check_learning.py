@@ -170,6 +170,9 @@ class LearningTests(unittest.TestCase):
             try:
                 before_started = sandbox.stats()["speculation"]["started"]
                 for number in range(101, 106):
+                    if number > 101:
+                        client.close()
+                        client = Client(sandbox.base, sandbox.tokens["agent"])
                     employee = f"E-{number:06d}"
                     call(client, "employee", employee)
                     if sandbox.stats()["speculation"]["started"] > before_started:
@@ -253,6 +256,9 @@ class LearningTests(unittest.TestCase):
             try:
                 before = sandbox.stats()["speculation"]["started"]
                 for number in range(101, 106):
+                    if number > 101:
+                        client.close()
+                        client = Client(sandbox.base, sandbox.tokens["agent"])
                     employee = f"E-{number:06d}"
                     call(client, "employee", employee)
                     if sandbox.stats()["speculation"]["started"] > before:
@@ -358,6 +364,71 @@ class LearningTests(unittest.TestCase):
                     for r in sandbox.predictions()["rules"]
                 )
             )
+
+    def test_history_separates_reversed_reads_and_approval_does_not_cross_context(self):
+        with Sandbox(BINARY, learning="approval", delay_ms=30, batch_validation=True) as sandbox:
+            for number in range(1, 13):
+                client = Client(sandbox.base, sandbox.tokens["agent"])
+                employee = f"E-{number:06d}"
+                try:
+                    call(client, "employee", employee)
+                    names = ["leave_balance", "leave_policy"]
+                    if number % 2:
+                        names.reverse()
+                    for name in names:
+                        time.sleep(0.025)
+                        self.assertIn("result", call(client, name, employee))
+                    client.request(
+                        "tools/call",
+                        {
+                            "name": "hr__record_case",
+                            "arguments": {
+                                "employee_id": employee,
+                                "kind": "needs_review",
+                                "days": 5,
+                            },
+                        },
+                    )
+                finally:
+                    client.close()
+            rules = sandbox.predictions()["rules"]
+            policy = next(
+                r
+                for r in rules
+                if r["after"] == "hr__leave_balance" and r["tool"] == "hr__leave_policy"
+            )
+            self.assertEqual(policy["confidence_percent"], 100)
+            self.assertEqual(policy["context"], ["hr__employee"])
+            self.assertEqual(policy["status"], "pending_approval")
+            sandbox.decide(policy["id"])
+            started = sandbox.stats()["speculation"]["started"]
+            client = Client(sandbox.base, sandbox.tokens["agent"])
+            try:
+                for name in ["employee", "leave_policy", "leave_balance"]:
+                    self.assertIn("result", call(client, name, "E-000101"))
+                self.assertEqual(sandbox.stats()["speculation"]["started"], started)
+            finally:
+                client.close()
+            asyncio.run(drain(sandbox))
+            self.assertEqual(sandbox.predictions()["context_bytes"], 0)
+
+    def test_drift_recovery_returns_without_escalating_shadow_requirement(self):
+        with Sandbox(
+            BINARY,
+            learning="auto",
+            delay_ms=35,
+            learning_options={"window": 8, "evaluation_samples": 3, "recovery_samples": 4},
+        ) as sandbox:
+            train(sandbox, count=4)
+            for cycle in range(3):
+                train(sandbox, start=100 + cycle * 100, count=12, wrong_every=1)
+                self.assertNotEqual(balance_rule(sandbox)["status"], "active")
+                train(sandbox, start=150 + cycle * 100, count=16)
+                rule = balance_rule(sandbox)
+                self.assertEqual(rule["status"], "active")
+                self.assertEqual(rule["recovery_observations_required"], 4)
+                self.assertGreaterEqual(rule["recoveries"], cycle + 1)
+            self.assertEqual(sandbox.peer_stats()["case_count"], 88)
 
 
 if __name__ == "__main__":

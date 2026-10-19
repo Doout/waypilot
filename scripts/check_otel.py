@@ -84,7 +84,7 @@ def main():
         serialized_spans = json.dumps(spans)
         assert all(secret not in serialized_spans for secret in ["E-000101", private_marker, private_receipt, state_demo.token, state_demo.admin]), "arguments, results or credentials leaked into trace fields"
         names = {span["name"] for span in spans}
-        required = {"waypilot.run", "waypilot.fragment", "mcp.prewarm", "mcp.tool", "workflow.node", "gateway.http", "mcp.gateway.request", "mcp.prepare", "mcp.invoke", "mcp.state.validate", "mcp.state.validate_batch", "mcp.state.validate_set", "waypilot.cache.lookup", "mcp.speculate", "mcp.predict", "mcp.learn", "mcp.learning"}
+        required = {"waypilot.run", "waypilot.fragment", "mcp.prewarm", "mcp.tool", "workflow.node", "gateway.http", "mcp.gateway.request", "mcp.prepare", "mcp.invoke", "mcp.state.validate", "mcp.state.validate_batch", "mcp.state.validate_set", "waypilot.cache.lookup", "mcp.speculate", "mcp.predict", "mcp.learn", "mcp.learning", "mcp.linear", "mcp.upstream"}
         assert required <= names, f"missing spans: {required - names}; stderr: {process.stderr[-2000:]}"
         dispositions = {
             attr["value"].get("stringValue")
@@ -102,6 +102,7 @@ def main():
         timed_nodes = [span for span in spans if span["name"] == "workflow.node" and timings <= {attr["key"] for attr in span.get("attributes", [])}]
         assert timed_nodes, "graph node wait/execution timings were not exported"
         assert any(span["name"] == "mcp.invoke" and {"queue_us", "exchange_us"} <= {attr["key"] for attr in span.get("attributes", [])} for span in spans), "upstream queue/exchange timing missing"
+        assert any(span["name"] == "mcp.upstream" and "admission_us" in {attr["key"] for attr in span.get("attributes", [])} for span in spans), "shared upstream admission timing missing"
         print(json.dumps({"otel_export": "passed", "spans": len(spans), "required_names": sorted(required), "dispositions": sorted(dispositions), "timed_graph_nodes": len(timed_nodes), "gateway_to_upstream_parentage": "passed"}))
     finally:
         collector.shutdown()

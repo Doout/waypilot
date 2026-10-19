@@ -19,6 +19,95 @@ def wait_check(demo, before):
     assert demo.mutate()["a"]["checks"] > before
 
 
+def pure_read_checks(binary):
+    checks = []
+    for transport in ["json", "sse", "stdio"]:
+        with StateDemo(binary, transport, pure=True) as demo:
+            client = Client(demo.base, demo.token)
+            before = demo.stats()["state_checks"]
+            first = client.call("owned__state_read", {"key": "a"})
+            assert first["_meta"]["io.waypilot/runtime"]["disposition"] == "executed"
+            assert demo.stats()["state_checks"] - before == 1, (transport, demo.stats())
+            before = demo.stats()["state_checks"]
+            warm = client.call("owned__state_read", {"key": "a"})
+            assert warm["_meta"]["io.waypilot/runtime"]["disposition"] == "reused"
+            assert demo.stats()["state_checks"] - before == 2
+            demo.mutate(key="a", touch=True)
+            newer = client.call("owned__state_read", {"key": "a"})
+            assert newer["_meta"]["io.waypilot/runtime"]["disposition"] == "executed"
+            assert newer["structuredContent"] == first["structuredContent"]
+            checks.append(transport + "_pure_cold_read_and_fresh_cache_hit")
+            restricted = Client(demo.base, demo.restricted)
+            before = demo.stats()["upstream_calls"]
+            denied = restricted.request(
+                "tools/call", {"name": "owned__state_read", "arguments": {"key": "a"}}
+            )
+            assert denied["error"]["code"] == -32003
+            assert demo.stats()["upstream_calls"] == before
+            restricted.close()
+            checks.append(transport + "_pure_read_requires_validator_grant")
+
+            demo.invalidate()
+            initial = client.call("waypilot__state", {})
+            demo.mutate(key="a", touch=True)
+            changed = client.call("waypilot__state", {})
+            assert (
+                changed["structuredContent"]["outputs"] == initial["structuredContent"]["outputs"]
+            )
+            assert steps(changed) == {
+                "left": "executed",
+                "left-index": "executed",
+                "right": "reused",
+                "right-index": "reused",
+            }
+            checks.append(transport + "_pure_branch_invalidation")
+            if transport != "stdio":
+                for target, modes in [
+                    ("read_mode", ["missing", "malformed", "error", "oversized", "wrong_resource"]),
+                    ("check_mode", ["missing", "malformed", "error", "oversized"]),
+                ]:
+                    for mode in modes:
+                        demo.invalidate()
+                        demo.mutate(**{target: mode})
+                        reply = client.request(
+                            "tools/call", {"name": "owned__state_read", "arguments": {"key": "a"}}
+                        )
+                        assert reply["error"]["code"] == -32010, reply
+                        assert demo.stats()["cache"]["entries"] == 0
+                        demo.mutate(**{target: "valid"})
+                checks.append(transport + "_pure_bad_result_and_validator_fail_closed")
+                demo.invalidate()
+                demo.mutate(change_after_read=True)
+                reply = client.request(
+                    "tools/call", {"name": "owned__state_read", "arguments": {"key": "a"}}
+                )
+                assert reply["error"]["code"] == -32010
+                assert demo.stats()["cache"]["entries"] == 0
+                demo.mutate(change_after_read=False)
+                checks.append(transport + "_pure_change_before_release")
+                demo.invalidate()
+                demo.mutate(read_ms=100)
+                clients = [Client(demo.base, demo.token) for _ in range(4)]
+                for follower in clients:
+                    follower.request("tools/list")
+                before = demo.mutate()["a"]["reads"]
+                try:
+                    with ThreadPoolExecutor(max_workers=4) as pool:
+                        results = list(
+                            pool.map(lambda c: c.call("owned__state_read", {"key": "a"}), clients)
+                        )
+                    assert all(
+                        r["structuredContent"] == first["structuredContent"] for r in results
+                    )
+                    assert demo.mutate()["a"]["reads"] - before == 1
+                finally:
+                    for follower in clients:
+                        follower.close()
+                checks.append(transport + "_pure_cold_singleflight")
+            client.close()
+    return checks
+
+
 def main():
     binary = sys.argv[1]
     checks = []
@@ -166,6 +255,7 @@ def main():
         assert demo.mutate()["a"]["reads"] == 1
         checks.append("validation_consumes_rate_budget")
         client.close()
+    checks.extend(pure_read_checks(binary))
     print(json.dumps({"state_regressions": "passed", "count": len(checks), "checks": checks}))
 
 

@@ -4,6 +4,10 @@
 
 Follow the [README](../README.md#test-and-benchmark) to install test dependencies, then run `bash scripts/verify.sh`. It runs formatting, Clippy, Rust tests, live JSON/SSE and stdio checks, the official Python MCP SDK, OTLP validation and a 64-client/32-call scale test.
 
+Verification uses full trace sampling to require graph coverage deterministically.
+Sampled load tests require request/invocation traces and validate graph timings when
+graph spans are sampled; a small graph phase can legitimately have no sampled roots.
+
 CI runs on Linux and macOS. Linux also runs the 1,000-client/500-call release test. Artifacts include `scale-smoke.json`, `benchmark.json`, `gateway-benchmark.json` and `mcp-demo.json`, plus Linux `scale-qualification.json`. Reports upload on failure too.
 
 Linux repeats automatic pattern learning in three fresh trials of 1,000 agents at
@@ -54,6 +58,40 @@ storage and sessions drain. Concurrency here counts pending gateway calls.
 target/sdk-venv/bin/python load/observation_qualify.py target/release/waypilot \
   --clients 1000 --concurrency 500 --output target/observation-scale.json
 ```
+
+## Continuous HR soak
+
+For a continuous one-hour comparison with changing agent behavior:
+
+```sh
+target/sdk-venv/bin/python load/hr_soak.py target/release/waypilot \
+  --seconds 3600 --rate 2 --concurrency 128 --trace-ratio 0.1 \
+  --require-uninterrupted \
+  --output-dir target/hr-soak-$(date +%Y%m%d-%H%M%S)
+```
+
+Three isolated paths run together: direct MCP, guarded reuse without prediction, and
+automatic learning from no rules. They receive identical seeded arrivals, pauses,
+aliases, branches and external balance updates, with 64 upstream slots each. Reads vary
+from a few milliseconds to three seconds; agent pauses range from zero to seven seconds.
+Leave/benefits proportions shift every ten minutes. Some callers abandon after a profile,
+request reads concurrently, reverse their order, or reread after an external update.
+This is a synthetic policy workload over real local MCP connections, without a paid LLM.
+
+The runner verifies each observation, compares per-conversation outputs across modes,
+and reconciles every case write. It records raw conversations, one-minute learning and
+resource snapshots, arrival-cohort latency, upstream work and bounded OTLP stage histograms.
+It fails on unexpected errors, effect mismatches, resource growth or incomplete cleanup.
+Output directories must be new. `--pause-scale 0.01 --seconds 18 --rate 1` provides a smoke
+check; use the default pause scale for measurements. This tests realistic pacing rather
+than the separate 1,000-connected-client/500-active-call capacity qualification.
+
+`--require-uninterrupted` rejects a wall/monotonic-clock discrepancy above two seconds or
+a monitor gap above ten seconds. Keep a laptop powered with its lid open; an idle-sleep
+inhibitor cannot prevent lid-closed sleep. Clock samples and successful-run diagnostics
+are retained. `--baseline /path/to/frozen/waypilot` adds the previous automatic predictor
+as a fourth path with the same plan and budgets, alongside direct, guarded and current
+automatic execution. Compare that path to isolate the runtime change from host/run noise.
 
 ## Forwarding overhead
 

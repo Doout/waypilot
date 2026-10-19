@@ -93,6 +93,12 @@ establish this contract, and an uncooperative server cannot acquire it through g
 
 Waypilot compares exact evidence before lookup, checks ancestor observations before dependent
 work, and validates all recorded observations again before the release authorization gate.
+For an explicitly effect-free, state-validated `speculative = true` read, a cold miss can
+obtain its version evidence from the read result itself. Cache absence is rechecked under
+singleflight; followers and cached hits still obtain fresh evidence before lookup. The
+new result's evidence is validated before release, and inherited observations still guard
+dependent calls and writes. This does not authorize an early call without the separate
+speculative grant.
 A changed witness invalidates the retained computation and its transitive descendants.
 Unchanged independent branches remain reusable. A recomputed parent gets a new receipt even
 if its value is identical. Unretained parents prevent descendant retention. Stale in-flight
@@ -112,7 +118,9 @@ Responses retain at most 64 distinct validation observations; their arguments an
 maps share the workflow's 1 MiB retained-data budget. Each map permits 1 to 64 resource/version
 pairs with nonempty strings up to 256 bytes. Arguments, results, and version values are not
 trace fields. `mcp.state.validate`, `waypilot.cache.lookup`, and the graph's `validate_state`
-node expose validation, lookup, and release-barrier timing. Admin statistics count validated
+node expose validation, lookup, and release-barrier timing. Single calls use a straight-line
+`mcp.linear` path with the same release checks; authored workflows use the graph executor.
+Admin statistics count validated
 observations (`state_checks`), batch RPCs (`state_batches`), conflicts, and cache invalidations.
 
 ### Batch validation
@@ -212,6 +220,11 @@ target/debug/waypilot serve --config examples/local.toml
 ```
 
 Spans cover ingress, MCP requests, preparation, invocation and graph nodes. Node fields separate dependency wait, scheduler wait and execution. Results include elapsed time and `executed`, `reused`, `joined` or `bypassed` under `_meta["io.waypilot/runtime"]`. Application trace fields exclude arguments, credentials and results.
+
+`admission_us` on `mcp.upstream` measures time acquiring server/global call capacity;
+`queue_us` on `mcp.invoke` measures the later per-session lock wait, and `exchange_us` measures
+upstream I/O. Admin statistics expose `upstream_waiters` and cumulative
+`upstream_admission_us`; those aggregate waits overlap across requests.
 
 The exporter also supports `http/protobuf`. Incoming W3C context extraction and upstream trace propagation are unsupported. Overlapping span durations do not add up to elapsed request time.
 

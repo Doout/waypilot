@@ -37,21 +37,24 @@ class Direct:
 
 
 @asynccontextmanager
-async def connection(sandbox, direct, slots):
+async def connection(sandbox, direct, slots, sdk_mode="legacy"):
     if direct:
         # No gateway token is sent to the upstream service.
         async with httpx2.AsyncClient(timeout=20) as http:
             async with Client(
                 streamable_http_client(sandbox.peer + "/mcp", http_client=http),
                 read_timeout_seconds=20,
+                mode=sdk_mode,
             ) as client:
                 yield Direct(client, slots)
     else:
-        async with connect(sandbox.url, sandbox.tokens["agent"]) as client:
+        async with connect(sandbox.url, sandbox.tokens["agent"], sdk_mode=sdk_mode) as client:
             yield client
 
 
-async def wave(sandbox, start, runs, concurrency, think_ms, wrong_every=0, *, direct=False):
+async def wave(
+    sandbox, start, runs, concurrency, think_ms, wrong_every=0, *, direct=False, sdk_mode="legacy"
+):
     semaphore = asyncio.Semaphore(concurrency)
     # Match the gateway's 64 active tools/call slots, including at high client load.
     upstream_slots = asyncio.Semaphore(64)
@@ -60,7 +63,9 @@ async def wave(sandbox, start, runs, concurrency, think_ms, wrong_every=0, *, di
     async def one(index):
         async with semaphore:
             started = time.perf_counter_ns()
-            async with connection(sandbox, direct, upstream_slots) as client:
+            async with connection(sandbox, direct, upstream_slots, sdk_mode) as client:
+                initialized = time.perf_counter_ns()
+                protocol_version = (client.client if direct else client).protocol_version
                 report = await run_agent(
                     client,
                     f"E-{start + index:06d}",
@@ -70,7 +75,12 @@ async def wave(sandbox, start, runs, concurrency, think_ms, wrong_every=0, *, di
                     think_ms=think_ms,
                     guarded=not direct and sandbox.mode != "off",
                 )
-            report["session_elapsed_ms"] = (time.perf_counter_ns() - started) / 1e6
+                finished = time.perf_counter_ns()
+            closed = time.perf_counter_ns()
+            report["session_elapsed_ms"] = (closed - started) / 1e6
+            report["initialization_ms"] = (initialized - started) / 1e6
+            report["shutdown_ms"] = (closed - finished) / 1e6
+            report["protocol_version"] = protocol_version
             report["completion_ms"] = (time.perf_counter_ns() - submitted) / 1e6
             return report
 
@@ -90,6 +100,10 @@ async def drain(sandbox):
             == stats["active_requests"]
             == stats["speculation"]["active"]
             == stats["cleanup"]["pending"]
+            == stats["cleanup"]["active"]
+            == stats["active_upstream"]
+            == stats["active_initializations"]
+            == stats.get("upstream_waiters", 0)
             == 0
         ):
             assert stats["observation_bytes"] == 0 and stats["cache"]["flights"] == 0
@@ -100,9 +114,9 @@ async def drain(sandbox):
 
 
 async def trial(args, mode):
-    learning = mode.removeprefix("learn_") if mode.startswith("learn_") else None
     baseline = mode.startswith("baseline_")
     profile = mode.removeprefix("baseline_") if baseline else mode
+    learning = profile.removeprefix("learn_") if profile.startswith("learn_") else None
     with Sandbox(
         args.baseline if baseline else args.binary,
         "off"
@@ -125,7 +139,13 @@ async def trial(args, mode):
     ) as sandbox:
         # Disjoint employees: training does not populate measurement cache keys.
         await wave(
-            sandbox, 1, args.training_runs, 1, args.training_think_ms, direct=mode == "direct"
+            sandbox,
+            1,
+            args.training_runs,
+            1,
+            args.training_think_ms,
+            direct=mode == "direct",
+            sdk_mode=args.sdk_mode,
         )
         await drain(sandbox)
         learned_before = sandbox.predictions() if not baseline else None
@@ -163,6 +183,7 @@ async def trial(args, mode):
                 args.think_ms,
                 args.wrong_every,
                 direct=mode == "direct",
+                sdk_mode=args.sdk_mode,
             )
             elapsed = time.perf_counter() - started
             final = await drain(sandbox)
@@ -245,6 +266,14 @@ async def trial(args, mode):
             "session_p50_ms": percentile([r["session_elapsed_ms"] for r in reports], 0.5),
             "session_p95_ms": percentile([r["session_elapsed_ms"] for r in reports], 0.95),
             "session_p99_ms": percentile([r["session_elapsed_ms"] for r in reports], 0.99),
+            "protocol_versions": sorted({r["protocol_version"] for r in reports}),
+            "session_phases": {
+                phase: {
+                    "p50_ms": percentile([r[phase + "_ms"] for r in reports], 0.5),
+                    "p95_ms": percentile([r[phase + "_ms"] for r in reports], 0.95),
+                }
+                for phase in ["initialization", "shutdown"]
+            },
             "completion_p95_ms": percentile([r["completion_ms"] for r in reports], 0.95),
             "agents_per_second": args.runs / elapsed,
             "wall_seconds": elapsed,
@@ -252,6 +281,10 @@ async def trial(args, mode):
             "total_upstream_rpcs": sum(calls.values()),
             "state_checks": final["state_checks"] - stats_before["state_checks"],
             "state_batches": final["state_batches"] - stats_before["state_batches"],
+            "upstream_admission_ms": (
+                final.get("upstream_admission_us", 0) - stats_before.get("upstream_admission_us", 0)
+            )
+            / 1000,
             "exact_effects": len(cases),
             "speculation": {
                 k: v - stats_before["speculation"][k] for k, v in final["speculation"].items()
@@ -288,6 +321,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary")
     parser.add_argument("--baseline", help="Frozen binary for baseline modes")
+    parser.add_argument(
+        "--sdk-mode",
+        choices=["legacy", "auto"],
+        default="legacy",
+        help="Match the 2025 handshake on both paths; auto also compares protocol negotiation",
+    )
     parser.add_argument("--training-think-ms", type=int, default=200)
     parser.add_argument("--runs", type=int, default=32)
     parser.add_argument("--concurrency", type=int, default=4)
@@ -301,11 +340,18 @@ def main():
     parser.add_argument("--training-runs", type=int, default=4)
     parser.add_argument("--rounds", type=int, default=2)
     parser.add_argument(
+        "--cooldown-seconds",
+        type=float,
+        default=0,
+        help="Pause outside measurements between modes, for hosts with small ephemeral port ranges",
+    )
+    parser.add_argument(
         "--mode",
         action="append",
         choices=[
             "direct",
             "off",
+            "prewarm_batch",
             "cache",
             "prewarm",
             "speculate",
@@ -315,6 +361,9 @@ def main():
             "learn_auto",
             "baseline_speculate_batch",
             "baseline_prewarm_batch",
+            "baseline_off",
+            "baseline_learn_observe",
+            "baseline_learn_auto",
         ],
     )
     parser.add_argument("--output", type=Path, required=True)
@@ -329,6 +378,7 @@ def main():
         and 0 <= args.wrong_every <= 1000
         and 1 <= args.slots <= 32
         and 1 <= args.rounds <= 6
+        and 0 <= args.cooldown_seconds <= 60
         and 0 <= args.training_runs <= 32
         and 0 <= args.training_think_ms <= 5000
         and (not any(mode.startswith("baseline_") for mode in (args.mode or [])) or args.baseline)
@@ -345,7 +395,7 @@ def main():
             "request_timeout_ms": 30000,
             "max_in_flight": max(64, args.concurrency + args.slots + 8),
             "model_calls": 0,
-            "direct": "Official MCP SDK connects to peer /mcp; idle gateway receives no requests; direct client caps active tools/call at 64",
+            "direct": "Official MCP SDK connects to peer /mcp; idle gateway receives no requests; direct client caps active tools/call at 64; SDK negotiation mode is the same on both paths",
             "guards": "Direct and off have no observation receipts; other modes enforce state-v1 and receipt guards",
             "latency": "p50/p95/p99 cover agent execution with think pauses; session percentiles also include SDK initialization and shutdown; completion includes client queueing",
             "prediction": "speculate modes use authored bindings; learn modes discover adjacent transitions and input/result mappings; all require explicit read/disclosure contracts; learn_approval approves eligible fixture candidates after training",
@@ -374,6 +424,7 @@ def main():
     try:
         for iteration in range(args.rounds):
             current = {}
+            report["rounds"].append(current)
             modes = args.mode or [
                 "direct",
                 "off",
@@ -387,10 +438,17 @@ def main():
             ]
             for mode in modes if iteration % 2 == 0 else reversed(modes):
                 result = asyncio.run(trial(args, mode))
+                if args.sdk_mode == "legacy":
+                    assert result["protocol_versions"] == ["2025-11-25"], (
+                        "matched benchmark negotiated a different protocol",
+                        mode,
+                        result["protocol_versions"],
+                    )
                 if oracle is None:
                     oracle = result["output_digest"]
                 assert oracle == result["output_digest"], "HR observations or decisions differ"
                 current[mode] = result
+                args.output.write_text(json.dumps(report, indent=2) + "\n")
                 print(
                     json.dumps(
                         {
@@ -405,8 +463,8 @@ def main():
                     ),
                     flush=True,
                 )
-            report["rounds"].append(current)
-            args.output.write_text(json.dumps(report, indent=2) + "\n")
+                if args.cooldown_seconds:
+                    time.sleep(args.cooldown_seconds)
         report.update(status="passed", output_equivalence=True, exact_effects=True)
     except BaseException as error:
         report.update(status="failed", error=str(error))

@@ -54,6 +54,25 @@ def observed(sandbox, employee, phase="end"):
 
 
 class HRTests(unittest.TestCase):
+    def test_direct_and_forwarding_use_the_same_protocol_and_plan(self):
+        async def run(sandbox):
+            direct = await wave(sandbox, 101, 2, 2, 0, direct=True, sdk_mode="legacy")
+            forwarded = await wave(sandbox, 101, 2, 2, 0, sdk_mode="legacy")
+            return direct, forwarded
+
+        with Sandbox(BINARY, mode="off", delay_ms=1) as sandbox:
+            direct, forwarded = asyncio.run(run(sandbox))
+            self.assertEqual(
+                [r["observations"] for r in direct], [r["observations"] for r in forwarded]
+            )
+            for report in direct + forwarded:
+                self.assertEqual(report["protocol_version"], "2025-11-25")
+                self.assertGreaterEqual(report["initialization_ms"], 0)
+                self.assertGreaterEqual(report["shutdown_ms"], 0)
+            self.assertEqual(sandbox.peer_stats()["case_count"], 4)
+            self.assertEqual(sandbox.stats()["state_checks"], 0)
+            asyncio.run(drain(sandbox))
+
     def test_slow_prediction_starts_with_returned_id_before_agent_demand(self):
         canonical = "E-009000"
         with Sandbox(
@@ -249,7 +268,9 @@ class HRTests(unittest.TestCase):
                     delay_ms=0,
                     batch_validation=True,
                     rate=1 if control == "rate" else 10000,
-                    burst=11 if control == "rate" else 10000,
+                    # Three cold pure reads use six tokens; leave fewer than
+                    # three for the pre-write observation checks.
+                    burst=8 if control == "rate" else 10000,
                 ) as sandbox,
             ):
                 client = Client(sandbox.base, sandbox.tokens["agent"])
@@ -529,7 +550,9 @@ class HRTests(unittest.TestCase):
             asyncio.run(drain(sandbox))
 
     def test_speculation_consumes_rate_budget_before_read_dispatch(self):
-        with Sandbox(BINARY, delay_ms=0, min_samples=2, rate=1, burst=16) as sandbox:
+        # Four training reads plus the trigger use ten tokens after removing
+        # redundant cold probes. The predicted read must still obtain a token.
+        with Sandbox(BINARY, delay_ms=0, min_samples=2, rate=1, burst=10) as sandbox:
             client = Client(sandbox.base, sandbox.tokens["agent"])
             try:
                 for employee in ["E-000001", "E-000002"]:
@@ -551,6 +574,38 @@ class HRTests(unittest.TestCase):
             self.assertGreater(sandbox.stats()["speculation"]["skipped"], 0)
             self.assertEqual(sandbox.stats()["speculation"]["started"], 0)
             asyncio.run(drain(sandbox))
+
+    def test_predictions_yield_to_upstream_pressure_and_resume_when_idle(self):
+        with Sandbox(BINARY, delay_ms=1, upstream_calls=2) as sandbox:
+            train(sandbox)
+            blocked = Client(sandbox.base, sandbox.tokens["agent"])
+            source = Client(sandbox.base, sandbox.tokens["agent"])
+            try:
+                sandbox.mutate(hold_tool="benefit_options")
+                before = sandbox.stats()["speculation"]
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    pending = pool.submit(call, blocked, "benefit_options", "E-009999")
+                    try:
+                        wait_for(lambda: sandbox.peer_stats()["active"] == 1)
+                        self.assertIn("result", call(source, "employee", "E-000101"))
+                        stats = sandbox.stats()["speculation"]
+                        self.assertEqual(stats["started"], before["started"])
+                        self.assertGreater(stats["pressure_skipped"], before["pressure_skipped"])
+                        self.assertFalse(observed(sandbox, "E-000101", "start"))
+                    finally:
+                        sandbox.mutate(hold_tool=None)
+                    self.assertIn("result", pending.result(timeout=5))
+                source.close()
+                source = Client(sandbox.base, sandbox.tokens["agent"])
+                self.assertIn("result", call(source, "employee", "E-000102"))
+                wait_for(lambda: observed(sandbox, "E-000102", "start"))
+                self.assertGreater(sandbox.stats()["speculation"]["started"], before["started"])
+            finally:
+                sandbox.mutate(hold_tool=None)
+                blocked.close()
+                source.close()
+            final = asyncio.run(drain(sandbox))
+            self.assertEqual(final["upstream_waiters"], 0)
 
     def test_policy_generation_resets_learning(self):
         with Sandbox(BINARY, delay_ms=1) as sandbox:

@@ -16,6 +16,7 @@ use std::{
     },
     time::Instant,
 };
+use tracing::Instrument;
 use wayframe_core::{Context, Decision, Phase, Reason};
 use wayframe_flow::{Builder, Error, Flow, Limits, Port};
 
@@ -80,7 +81,6 @@ struct Inputs {
 }
 #[derive(Clone)]
 struct Node {
-    catalog_revision: String,
     result: Value,
     disposition: &'static str,
     elapsed_us: u128,
@@ -94,17 +94,20 @@ fn fail(call: &Call, fault: Fault) -> Error {
     }
     Error::Failed("tool_or_binding_failed")
 }
+fn state_bytes(state: &RemoteState) -> usize {
+    state.arguments.to_string().len()
+        + state
+            .evidence
+            .resources()
+            .iter()
+            .map(|(k, v)| k.len() + v.len())
+            .sum::<usize>()
+}
 fn record(call: &Call, lineage: &Lineage) -> Result<(), Error> {
     let mut states = call.states.lock().expect("workflow states poisoned");
     for state in &lineage.states {
         if !states.contains(state) {
-            let bytes = state.arguments.to_string().len()
-                + state
-                    .evidence
-                    .resources()
-                    .iter()
-                    .map(|(k, v)| k.len() + v.len())
-                    .sum::<usize>();
+            let bytes = state_bytes(state);
             if call
                 .retained
                 .fetch_add(bytes, Ordering::Relaxed)
@@ -181,95 +184,57 @@ fn failure(call: &Call, error: Error) -> Fault {
     }
 }
 
-pub(crate) struct Single {
-    flow: Flow<Call>,
-    output: Port<Node>,
-}
-impl Single {
-    pub fn new(maximum: usize) -> Result<Self> {
-        let mut builder = Builder::<Call>::new().limits(limits(maximum));
-        let root = builder.input();
-        let authorized =
-            builder.gate("authorize", Phase::Authorize, &root, |call| gate(call, &[]))?;
-        let result =
-            builder.asynchronous("invoke", Phase::Authorize, &root, |call| async move {
-                let result = call
-                    .gateway
-                    .invoke(
-                        call.session.clone(),
-                        &call.name,
-                        call.arguments.clone(),
-                        call.deadline.into(),
-                        call.epoch,
-                        &Lineage::default(),
-                    )
-                    .await
-                    .map_err(|error| fail(&call, error))?;
-                record(&call, &result.lineage)?;
-                Ok(Node {
-                    catalog_revision: result.catalog_revision,
-                    lineage: result.lineage,
-                    result: result.result,
-                    disposition: result.disposition,
-                    elapsed_us: result.elapsed_us,
-                })
-            })?;
-        builder.depends_on(&result, &authorized)?;
-        let current = builder.gate("authorize_release", Phase::Authorize, &root, |call| {
-            gate(call, &[])
-        })?;
-        let validated =
-            builder.asynchronous("validate_state", Phase::Authorize, &root, validate)?;
-        builder.depends_on(&validated, &result)?;
-        builder.depends_on(&current, &validated)?;
-        let output =
-            builder.dispatch(
-                "release",
-                &result,
-                |result| async move { Ok((*result).clone()) },
-            )?;
-        builder.depends_on(&output, &authorized)?;
-        builder.depends_on(&output, &current)?;
-        Ok(Self {
-            flow: builder.compile()?,
-            output,
-        })
-    }
-    pub async fn run(
-        &self,
-        gateway: Arc<Gateway>,
-        session: Arc<Session>,
-        name: String,
-        arguments: Value,
-        deadline: tokio::time::Instant,
-        epoch: u64,
-    ) -> Result<Outcome, Fault> {
+/// A single tool has no fan-out or dynamic dependency schedule. Keep its controls
+/// in order without allocating a graph run, retained nodes or cloned results.
+pub(crate) async fn single(
+    gateway: Arc<Gateway>,
+    session: Arc<Session>,
+    name: String,
+    arguments: Value,
+    deadline: tokio::time::Instant,
+    epoch: u64,
+) -> Result<Outcome, Fault> {
+    async {
         let started = Instant::now();
-        let call = Arc::new(Call {
-            gateway,
-            session,
-            name,
-            arguments,
-            deadline: deadline.into_std(),
-            epoch,
-            error: Mutex::new(None),
-            retained: AtomicUsize::new(0),
-            states: Mutex::new(Vec::new()),
-        });
-        let run = self
-            .flow
-            .run(call.clone())
-            .await
-            .map_err(|error| failure(&call, error.error))?;
-        let result = run.get(&self.output).expect("released direct result");
-        Ok(Outcome {
-            catalog_revision: result.catalog_revision.clone(),
-            result: result.result.clone(),
-            disposition: result.disposition,
-            elapsed_us: started.elapsed().as_micros(),
-            lineage: result.lineage.clone(),
-        })
+        let mut outcome = gateway
+            .invoke(
+                session.clone(),
+                &name,
+                arguments,
+                deadline,
+                epoch,
+                &Lineage::default(),
+            )
+            .await?;
+        if outcome.lineage.states.len() > 64
+            || outcome
+                .lineage
+                .states
+                .iter()
+                .map(|state| state_bytes(state))
+                .sum::<usize>()
+                > crate::upstream::MAX_MESSAGE
+        {
+            return Err(Fault {
+                code: -32002,
+                message: "workflow state evidence budget exceeded",
+            });
+        }
+        gateway
+            .validate_states(&session, &outcome.lineage.states, deadline, epoch)
+            .await?;
+        gateway.authorize(&session, &name, epoch)?;
+        if tokio::time::Instant::now() >= deadline {
+            return Err(Fault {
+                code: -32008,
+                message: "request deadline exceeded; issued effects may have completed",
+            });
+        }
+        outcome.elapsed_us = started.elapsed().as_micros();
+        Ok(outcome)
     }
+    .instrument(tracing::info_span!("mcp.linear"))
+    .await
 }
 
 pub(crate) struct Compiled {
@@ -401,7 +366,6 @@ impl Compiled {
                         }
                         record(&inputs.call, &result.lineage)?;
                         Ok(Node {
-                            catalog_revision: result.catalog_revision,
                             lineage: result.lineage,
                             result: result.result,
                             disposition: result.disposition,

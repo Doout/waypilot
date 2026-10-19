@@ -183,6 +183,7 @@ pub struct Learning {
     pub evaluation_samples: usize,
     pub holdout_every: u64,
     pub recovery_samples: u64,
+    pub context_depth: usize,
     pub context_bytes: usize,
 }
 impl Default for Learning {
@@ -196,6 +197,7 @@ impl Default for Learning {
             evaluation_samples: 8,
             holdout_every: 5,
             recovery_samples: 16,
+            context_depth: 2,
             context_bytes: 1024 * 1024,
         }
     }
@@ -449,6 +451,7 @@ impl Config {
                         && (2..=learning.window).contains(&learning.evaluation_samples)
                         && (2..=100).contains(&learning.holdout_every)
                         && (speculation.min_samples..=1000).contains(&learning.recovery_samples)
+                        && learning.context_depth <= 4
                         && (16384..=16 * 1024 * 1024).contains(&learning.context_bytes),
                     "invalid learning budgets"
                 );

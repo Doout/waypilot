@@ -18,7 +18,9 @@ from .runner import validate_endpoint
 
 
 @asynccontextmanager
-async def connect(url, token, *, sandbox=None, role="investigator", transport="http"):
+async def connect(
+    url, token, *, sandbox=None, role="investigator", transport="http", sdk_mode="auto"
+):
     if transport == "stdio":
         if sandbox is None:
             raise ValueError("stdio ingress requires a local sandbox")
@@ -27,7 +29,9 @@ async def connect(url, token, *, sandbox=None, role="investigator", transport="h
             args=["serve-stdio", "--config", str(sandbox.config), "--user", role],
             env=sandbox.env,
         )
-        async with Client(stdio_client(parameters), read_timeout_seconds=20) as client:
+        async with Client(
+            stdio_client(parameters), read_timeout_seconds=20, mode=sdk_mode
+        ) as client:
             yield client
     else:
         validate_endpoint(url)
@@ -35,7 +39,9 @@ async def connect(url, token, *, sandbox=None, role="investigator", transport="h
             headers={"Authorization": f"Bearer {token}"}, timeout=20
         ) as connection:
             async with Client(
-                streamable_http_client(url, http_client=connection), read_timeout_seconds=20
+                streamable_http_client(url, http_client=connection),
+                read_timeout_seconds=20,
+                mode=sdk_mode,
             ) as client:
                 yield client
 

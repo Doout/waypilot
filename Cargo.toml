@@ -22,12 +22,12 @@ toml = "0.8"
 subtle = "2"
 rand = "0.9"
 tokio-util = { version = "0.7", features = ["rt"] }
-wayframe-codec = { git = "https://github.com/Doout/wayframe", rev = "2e1ed6f8c6f71e6cc7fdbb9eac38ad5ffba77979" }
-wayframe-cache = { git = "https://github.com/Doout/wayframe", rev = "2e1ed6f8c6f71e6cc7fdbb9eac38ad5ffba77979" }
-wayframe-core = { git = "https://github.com/Doout/wayframe", rev = "2e1ed6f8c6f71e6cc7fdbb9eac38ad5ffba77979" }
-wayframe-flow = { git = "https://github.com/Doout/wayframe", rev = "2e1ed6f8c6f71e6cc7fdbb9eac38ad5ffba77979" }
-wayframe-transport = { git = "https://github.com/Doout/wayframe", rev = "2e1ed6f8c6f71e6cc7fdbb9eac38ad5ffba77979" }
-wayframe-observability = { git = "https://github.com/Doout/wayframe", rev = "2e1ed6f8c6f71e6cc7fdbb9eac38ad5ffba77979", features = ["otel"] }
+wayframe-codec = { git = "https://github.com/Doout/wayframe", rev = "0afc5a79b948651bb06f90eb0a6f1d251c34eed5" }
+wayframe-cache = { git = "https://github.com/Doout/wayframe", rev = "0afc5a79b948651bb06f90eb0a6f1d251c34eed5" }
+wayframe-core = { git = "https://github.com/Doout/wayframe", rev = "0afc5a79b948651bb06f90eb0a6f1d251c34eed5" }
+wayframe-flow = { git = "https://github.com/Doout/wayframe", rev = "0afc5a79b948651bb06f90eb0a6f1d251c34eed5" }
+wayframe-transport = { git = "https://github.com/Doout/wayframe", rev = "0afc5a79b948651bb06f90eb0a6f1d251c34eed5" }
+wayframe-observability = { git = "https://github.com/Doout/wayframe", rev = "0afc5a79b948651bb06f90eb0a6f1d251c34eed5", features = ["otel"] }
 
 [lints.rust]
 unsafe_code = "forbid"

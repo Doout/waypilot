@@ -23,6 +23,7 @@ struct Rule {
     user: String,
     after: String,
     source_revision: String,
+    context: Vec<String>,
     tool: String,
     target_revision: String,
     shape: Value,
@@ -39,6 +40,8 @@ struct Rule {
     unused: u64,
     retired: Option<(u64, &'static str)>,
     retirements: u32,
+    recovery_progress: u64,
+    recoveries: u64,
     trial_generation: u64,
     cancel: CancellationToken,
 }
@@ -77,6 +80,7 @@ pub(super) struct SessionLearning {
 }
 struct Observation {
     name: String,
+    context: Vec<String>,
     revision: String,
     sources: BTreeMap<Source, Value>,
     finished: Instant,
@@ -238,8 +242,7 @@ impl Rule {
         Some(args)
     }
     fn recovery_samples(&self, learner: &Learner) -> u64 {
-        (learner.config.recovery_samples * (1u64 << self.retirements.saturating_sub(1).min(6)))
-            .min(4096)
+        learner.config.recovery_samples
     }
     fn retire(&mut self, reason: &'static str) {
         if self.retired.is_none() {
@@ -247,6 +250,7 @@ impl Rule {
             self.trial_generation += 1;
         }
         self.retired = Some((self.observations, reason));
+        self.recovery_progress = 0;
         self.cancel.cancel();
     }
     fn baseline(&self) -> f64 {
@@ -313,6 +317,7 @@ impl Rule {
                 &self.user,
                 &self.after,
                 &self.source_revision,
+                &self.context,
                 &self.tool,
                 &self.target_revision,
                 &self.shape,
@@ -355,8 +360,14 @@ impl Learner {
     fn value_hash(&self, value: &Value) -> String {
         digest(&serde_json::to_vec(&(&self.salt, value)).expect("value identity"))
     }
-    fn observation(&self, name: &str, args: &Value, outcome: &Outcome) -> Option<Observation> {
-        if outcome.catalog_revision.is_empty() {
+    fn observation(
+        &self,
+        name: &str,
+        args: &Value,
+        outcome: &Outcome,
+        context: Vec<String>,
+    ) -> Option<Observation> {
+        if outcome.catalog_revision.is_empty() || name.len() > 256 {
             return None;
         }
         let result = outcome
@@ -395,12 +406,16 @@ impl Learner {
         let bytes = sources
             .iter()
             .map(|(p, v)| p.pointer.len() + v.to_string().len() + 128)
-            .sum::<usize>();
+            .sum::<usize>()
+            + context.iter().map(|name| name.len() + 32).sum::<usize>()
+            + name.len()
+            + outcome.catalog_revision.len();
         if bytes > CONTEXT_LIMIT {
             return None;
         }
         Some(Observation {
             name: name.into(),
+            context,
             revision: outcome.catalog_revision.clone(),
             sources,
             finished: Instant::now(),
@@ -459,7 +474,10 @@ impl Learner {
         Self::reset(&mut state, epoch);
         let mut found = false;
         for rule in state.rules.iter_mut().filter(|r| {
-            r.user == user && r.after == prior.name && r.source_revision == prior.revision
+            r.user == user
+                && r.after == prior.name
+                && r.source_revision == prior.revision
+                && r.context == prior.context
         }) {
             let same = rule.tool == name
                 && rule.target_revision == outcome.catalog_revision
@@ -491,6 +509,8 @@ impl Learner {
                     rule.opportunities = 0;
                     rule.retired = None;
                     rule.retirements = 0;
+                    rule.recovery_progress = 0;
+                    rule.recoveries = 0;
                     rule.trial_generation += 1;
                     // Changed provenance needs its own approval and outcome evidence.
                 }
@@ -515,13 +535,27 @@ impl Learner {
                     });
                 }
             }
-            if rule.retired.is_some_and(|(at, _)| {
-                rule.observations.saturating_sub(at) >= rule.recovery_samples(self)
-            }) && rule.qualified(self)
+            // Only real, unselected demand supplies recovery evidence. Misses
+            // and absent wait benefit erode that evidence; predictions cannot
+            // train themselves back into service. Recent qualification gates
+            // and the ordinary trial waste budget still apply.
+            if rule.retired.is_some() && !selected {
+                if matched && gap_us.min(elapsed_us) >= self.config.min_savings_ms as f64 * 1000.0 {
+                    rule.recovery_progress =
+                        (rule.recovery_progress + 1).min(rule.recovery_samples(self));
+                } else {
+                    rule.recovery_progress = rule.recovery_progress.saturating_sub(1);
+                }
+            }
+            if rule.retired.is_some()
+                && rule.recovery_progress >= rule.recovery_samples(self)
+                && rule.qualified(self)
             {
                 rule.retired = None;
                 rule.feedback.clear();
                 rule.cancel = CancellationToken::new();
+                rule.recoveries += 1;
+                rule.recovery_progress = 0;
             }
         }
         if !found && eligible && !outcome.catalog_revision.is_empty() {
@@ -549,6 +583,7 @@ impl Learner {
                     user: user.into(),
                     after: prior.name.clone(),
                     source_revision: prior.revision.clone(),
+                    context: prior.context.clone(),
                     tool: name.into(),
                     target_revision: outcome.catalog_revision.clone(),
                     shape,
@@ -568,6 +603,8 @@ impl Learner {
                     unused: 0,
                     retired: None,
                     retirements: 0,
+                    recovery_progress: 0,
+                    recoveries: 0,
                     trial_generation: 0,
                     cancel: CancellationToken::new(),
                 };
@@ -593,6 +630,7 @@ impl Learner {
                 r.user == user
                     && r.after == current.name
                     && r.source_revision == current.revision
+                    && r.context == current.context
                     && r.status(self, &state) == "active"
                     && r.arguments(current).is_some()
             })
@@ -730,12 +768,12 @@ impl Learner {
         Self::reset(&mut state, epoch);
         let rules: Vec<_> = state.rules.iter().map(|r| {
             let bindings: BTreeMap<_,_> = r.bindings.iter().map(|(p,b)| (p, json!({"sources":b.sources,"varied":b.varied}))).collect();
-            json!({"id":r.id,"user":r.user,"after":r.after,"tool":r.tool,"arguments":bindings,
+            json!({"id":r.id,"user":r.user,"after":r.after,"context":r.context,"tool":r.tool,"arguments":bindings,
                 "argument_shape":r.shape,"status":r.status(self,&state),"qualification_reason":r.qualification_reason(self),"approved":state.decisions.get(&r.id),"retired_reason":r.retired.map(|(_,why)|why),
                 "samples":r.samples.len(),"matches":r.samples.iter().filter(|s|s.matched).count(),
                 "confidence_percent":r.confidence()*100.0,"control_samples":r.controls.len(),
                 "baseline_mean_ms":r.baseline()/1000.0,"estimated_net_saving_ms":r.estimated_saving()/1000.0,
-                "retirements":r.retirements,"recovery_observations_required":r.recovery_samples(self),
+                "retirements":r.retirements,"recoveries":r.recoveries,"recovery_progress":r.recovery_progress,"recovery_observations_required":r.recovery_samples(self),
                 "prediction_samples":r.feedback.len(),"started":r.started,"reused":r.reused,"unused":r.unused,"holdouts":r.holdouts,
                 "mean_demand_wait_ms":r.feedback.iter().filter(|f|f.reused).map(|f|f.wait_us).sum::<f64>() / r.feedback.iter().filter(|f|f.reused).count().max(1) as f64 / 1000.0,
                 "baseline_relative_net_saving_ms":r.feedback.iter().map(|f|f.saved_us).sum::<f64>()/r.feedback.len().max(1) as f64/1000.0})
@@ -821,6 +859,15 @@ impl Demand {
         if !valid {
             return None;
         }
+        let context = self.previous.as_ref().map_or_else(Vec::new, |prior| {
+            let mut context = prior.context.clone();
+            context.push(prior.name.clone());
+            let remove = context
+                .len()
+                .saturating_sub(self.learner.config.context_depth);
+            context.drain(..remove);
+            context
+        });
         if let Some(prior) = self.previous.take() {
             self.learner.observe(
                 &self.session.actor.settings.id,
@@ -838,7 +885,7 @@ impl Demand {
                 gateway.learning_eligible(&self.session, name),
             );
         }
-        let current = self.learner.observation(name, args, outcome);
+        let current = self.learner.observation(name, args, outcome, context);
         let nomination = current.as_ref().and_then(|current| {
             self.learner
                 .nominate(&self.session.actor.settings.id, self.epoch, current)

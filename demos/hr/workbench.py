@@ -114,6 +114,9 @@ class HR:
         }
         return values[name], f"{name}:{requested}"
 
+    def read_delay_ms(self, name, arguments):
+        return self.read_delays.get(name, self.delay_ms)
+
     async def call(self, name, arguments):
         started = time.monotonic_ns()
         self.calls[name] += 1
@@ -189,7 +192,7 @@ class HR:
                     value = {}
                 if self.hold_tool == name:
                     await self.release.wait()
-                delay = self.state_ms if checking else self.read_delays.get(name, self.delay_ms)
+                delay = self.state_ms if checking else self.read_delay_ms(name, query)
                 await asyncio.sleep(delay / 1000)
             result = {
                 "content": [{"type": "text", "text": json.dumps(value)}],
